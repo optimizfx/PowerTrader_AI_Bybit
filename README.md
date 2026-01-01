@@ -50,7 +50,7 @@ Keep your API keys private. We are not giving financial advice. We are not respo
 
 1. Do not download the zip file of the repo! There is an issue I have to fix.
 2. Create a folder on your computer, like: `C:\PowerTraderAI\`
-3. On the PowerTrader_AI repo page, right click pt_hub.py and click "Save Link As..." and save it into the folder you just created.
+3. On the PowerTrader_AI repo page, go to the code page for pt_hub.py, click the "Download Raw File" button, save it into the folder you just created.
 4. Repeat that for all files in the repo (except the readme and the license).
 
 ---

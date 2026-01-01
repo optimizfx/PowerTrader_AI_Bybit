@@ -595,7 +595,51 @@ class PowerTraderBot:
         except Exception:
             return 0
 
+    @staticmethod
+    def _read_long_price_levels(symbol: str) -> list:
+        """
+        Reads low_bound_prices.html from the per-coin folder and returns a list of LONG (blue) price levels.
 
+        Returned ordering is highest->lowest so:
+          N1 = 1st blue line (top)
+          ...
+          N7 = 7th blue line (bottom)
+        """
+        sym = str(symbol).upper().strip()
+        folder = base_paths.get(sym, main_dir if sym == "BTC" else os.path.join(main_dir, sym))
+        path = os.path.join(folder, "low_bound_prices.html")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = (f.read() or "").strip()
+            if not raw:
+                return []
+
+            # Normalize common formats: python-list, comma-separated, newline-separated
+            raw = raw.strip().strip("[]()")
+            raw = raw.replace(",", " ").replace(";", " ").replace("|", " ")
+            raw = raw.replace("\n", " ").replace("\t", " ")
+            parts = [p for p in raw.split() if p]
+
+            vals = []
+            for p in parts:
+                try:
+                    vals.append(float(p))
+                except Exception:
+                    continue
+
+            # De-dupe, then sort high->low for stable N1..N7 mapping
+            out = []
+            seen = set()
+            for v in vals:
+                k = round(float(v), 12)
+                if k in seen:
+                    continue
+                seen.add(k)
+                out.append(float(v))
+            out.sort(reverse=True)
+            return out
+        except Exception:
+            return []
 
 
 
@@ -1136,9 +1180,9 @@ class PowerTraderBot:
             else:
                 next_dca_display = f"{hard_next:.2f}%"
 
-            # --- DCA DISPLAY LINE (pick whichever trigger line is higher: NEURAL vs HARD) ---
+            # --- DCA DISPLAY LINE (show whichever trigger will be hit first: higher of NEURAL line vs HARD line) ---
             # Hardcoded gives an actual price line: cost_basis * (1 + hard_next%).
-            # Neural is level-based; for display we treat it as "higher" only once its condition is already met.
+            # Neural gives an actual price line from low_bound_prices.html (N4..N7 = 4th..7th blue line).
             dca_line_source = "HARD"
             dca_line_price = 0.0
             dca_line_pct = 0.0
@@ -1146,24 +1190,27 @@ class PowerTraderBot:
             if avg_cost_basis > 0:
                 # Hardcoded trigger line price
                 hard_line_price = avg_cost_basis * (1.0 + (hard_next / 100.0))
+
+                # Default to hardcoded unless neural line is higher (hit first)
                 dca_line_price = hard_line_price
 
-                # If neural is already satisfied for this stage, then neural is effectively the "higher/earlier" trigger.
-                # For display purposes, treat that as an immediate line at current price (i.e., DCA is ready NOW).
                 if next_stage < 4:
-                    neural_level_needed_disp = next_stage + 4
-                    neural_level_now_disp = self._read_long_dca_signal(symbol)
+                    neural_level_needed_disp = next_stage + 4  # stage 0->N4, 1->N5, 2->N6, 3->N7
+                    neural_levels = self._read_long_price_levels(symbol)  # highest->lowest == N1..N7
 
-                    neural_ready_now = (gain_loss_percentage_buy < 0) and (neural_level_now_disp >= neural_level_needed_disp)
-                    if neural_ready_now:
-                        neural_line_price = current_buy_price
-                        if neural_line_price > dca_line_price:
-                            dca_line_price = neural_line_price
-                            dca_line_source = f"NEURAL N{neural_level_needed_disp}"
+                    neural_line_price = 0.0
+                    if len(neural_levels) >= neural_level_needed_disp:
+                        neural_line_price = float(neural_levels[neural_level_needed_disp - 1])
+
+                    # Whichever is higher will be hit first as price drops
+                    if neural_line_price > dca_line_price:
+                        dca_line_price = neural_line_price
+                        dca_line_source = f"NEURAL N{neural_level_needed_disp}"
 
                 # PnL% shown alongside DCA is the normal buy-side PnL%
                 # (same calculation as GUI "Buy Price PnL": current buy/ask vs avg cost basis)
                 dca_line_pct = gain_loss_percentage_buy
+
 
 
 
@@ -1271,9 +1318,15 @@ class PowerTraderBot:
                     state = {"active": False, "line": base_pm_line, "peak": 0.0, "was_above": False}
                     self.trailing_pm[symbol] = state
                 else:
-                    # Never let the line be below the (possibly updated) base PM start line
-                    if state.get("line", 0.0) < base_pm_line:
+                    # IMPORTANT:
+                    # If trailing hasn't activated yet, this is just the PM line.
+                    # It MUST track the current avg_cost_basis (so it can move DOWN after each DCA).
+                    if not state.get("active", False):
                         state["line"] = base_pm_line
+                    else:
+                        # Once trailing is active, the line should never be below the base PM start line.
+                        if state.get("line", 0.0) < base_pm_line:
+                            state["line"] = base_pm_line
 
                 # Use SELL price because that's what you actually get when you market sell
                 above_now = current_sell_price >= state["line"]
@@ -1312,7 +1365,6 @@ class PowerTraderBot:
                             tag="TRAIL_SELL",
                         )
 
-
                         trades_made = True
                         self.trailing_pm.pop(symbol, None)  # clear per-coin trailing state on exit
 
@@ -1326,6 +1378,7 @@ class PowerTraderBot:
 
                 # Save this tick’s position relative to the line (needed for “above -> below” detection)
                 state["was_above"] = above_now
+
 
             # DCA (NEURAL or hardcoded %, whichever hits first for the current stage)
             # Trade starts at neural level 3 => trader is at stage 0.
@@ -1394,10 +1447,15 @@ class PowerTraderBot:
                         # Only record a DCA buy timestamp on success (so skips never advance anything)
                         self._note_dca_buy(symbol)
 
+                        # DCA changes avg_cost_basis, so the PM line must be rebuilt from the new basis
+                        # (this will re-init to 5% if DCA=0, or 2.5% if DCA>=1)
+                        self.trailing_pm.pop(symbol, None)
+
                         trades_made = True
                         print(f"  Successfully placed DCA buy order for {symbol}.")
                     else:
                         print(f"  Failed to place DCA buy order for {symbol}.")
+
                 else:
                     print(f"  Skipping DCA for {symbol}. Not enough funds.")
 
