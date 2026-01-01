@@ -273,6 +273,8 @@ class NeuralSignalTile(ttk.Frame):
 DEFAULT_SETTINGS = {
     "main_neural_dir": r"C:\PowerTrader_AI",
     "coins": ["BTC", "ETH", "XRP", "BNB", "DOGE"],
+    "exchange": "ROBINHOOD",
+    "bybit_demo": False,
     "default_timeframe": "1hour",
     "timeframes": [
         "1min", "5min", "15min", "30min",
@@ -4341,6 +4343,95 @@ class PowerTraderHub(tk.Tk):
                 # keep column alignment consistent
                 ttk.Label(frm, text="").grid(row=r, column=2, sticky="e", padx=(10, 0), pady=6)
 
+        def _open_bybit_api_wizard() -> None:
+            """
+            Wizard for Bybit API credentials (b_key.txt / b_secret.txt).
+            """
+            import webbrowser
+            try:
+                from pybit.unified_trading import HTTP
+            except ImportError:
+                messagebox.showerror("Missing dependency", "pybit is required. Run 'pip install pybit'.")
+                return
+
+            wiz = tk.Toplevel(win)
+            wiz.title("Bybit API Setup")
+            wiz.geometry("800x600")
+            wiz.configure(bg=DARK_BG)
+
+            viewport = ttk.Frame(wiz)
+            viewport.pack(fill="both", expand=True, padx=12, pady=12)
+            
+            # Simple form
+            frm_wiz = ttk.Frame(viewport)
+            frm_wiz.pack(fill="both", expand=True)
+
+            ttk.Label(frm_wiz, text="Bybit API Setup", font=("Segoe UI", 16, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 20))
+            
+            # Key / Secret
+            key_var = tk.StringVar()
+            secret_var = tk.StringVar()
+            demo_var = tk.BooleanVar(value=self.settings.get("bybit_demo", False))
+
+            def _get_files():
+                 return os.path.join(self.project_dir, "b_key.txt"), os.path.join(self.project_dir, "b_secret.txt")
+
+            # Load existing
+            bk, bs = _get_files()
+            if os.path.exists(bk): 
+                with open(bk, 'r') as f: key_var.set(f.read().strip())
+            if os.path.exists(bs):
+                with open(bs, 'r') as f: secret_var.set(f.read().strip())
+
+            r_wiz = 1
+            ttk.Label(frm_wiz, text="API Key:").grid(row=r_wiz, column=0, sticky="w", pady=5); 
+            ttk.Entry(frm_wiz, textvariable=key_var, width=50).grid(row=r_wiz, column=1, sticky="w", pady=5); r_wiz+=1
+
+            ttk.Label(frm_wiz, text="API Secret:").grid(row=r_wiz, column=0, sticky="w", pady=5); 
+            ttk.Entry(frm_wiz, textvariable=secret_var, width=50).grid(row=r_wiz, column=1, sticky="w", pady=5); r_wiz+=1
+
+            ttk.Checkbutton(frm_wiz, text="Use Demo", variable=demo_var).grid(row=r_wiz, column=1, sticky="w", pady=10); r_wiz+=1
+
+            def _test():
+                k = key_var.get().strip()
+                s = secret_var.get().strip()
+                t = demo_var.get()
+                if not k or not s:
+                    messagebox.showerror("Error", "Enter Key and Secret.")
+                    return
+                try:
+                    session = HTTP(demo=t, api_key=k, api_secret=s)
+                    # Test call
+                    session.get_wallet_balance(accountType="UNIFIED")
+                    messagebox.showinfo("Success", "Connection successful!")
+                except Exception as e:
+                    messagebox.showerror("Failed", f"Connection failed:\n{e}")
+
+            def _save_bybit():
+                k = key_var.get().strip()
+                s = secret_var.get().strip()
+                bk, bs = _get_files()
+                try:
+                    with open(bk, 'w') as f: f.write(k)
+                    with open(bs, 'w') as f: f.write(s)
+                    
+                    # Also update settings for demo preference
+                    self.settings["bybit_demo"] = demo_var.get()
+                    self._save_settings()
+                    
+                    messagebox.showinfo("Saved", "Attributes saved.")
+                    wiz.destroy()
+                    _refresh_bybit_status() # Parent window refresh
+                except Exception as e:
+                    messagebox.showerror("Error", f"Save failed: {e}")
+
+            btn_frame = ttk.Frame(frm_wiz)
+            btn_frame.grid(row=r_wiz, column=0, columnspan=2, pady=20)
+            ttk.Button(btn_frame, text="Test Connection", command=_test).pack(side="left", padx=5)
+            ttk.Button(btn_frame, text="Save", command=_save_bybit).pack(side="left", padx=5)
+            ttk.Button(btn_frame, text="Cancel", command=wiz.destroy).pack(side="left", padx=5)
+
+
         main_dir_var = tk.StringVar(value=self.settings["main_neural_dir"])
         coins_var = tk.StringVar(value=",".join(self.settings["coins"]))
         hub_dir_var = tk.StringVar(value=self.settings.get("hub_data_dir", ""))
@@ -4354,16 +4445,47 @@ class PowerTraderHub(tk.Tk):
         candles_limit_var = tk.StringVar(value=str(self.settings["candles_limit"]))
         auto_start_var = tk.BooleanVar(value=bool(self.settings.get("auto_start_scripts", False)))
 
+        exchange_var = tk.StringVar(value=self.settings.get("exchange", "ROBINHOOD"))
+
         r = 0
         add_row(r, "Main neural folder:", main_dir_var, browse="dir"); r += 1
         add_row(r, "Coins (comma):", coins_var); r += 1
-        add_row(r, "Hub data dir (optional):", hub_dir_var, browse="dir"); r += 1
+        
+        # Exchange Selection
+        ttk.Label(frm, text="Exchange:").grid(row=r, column=0, sticky="w", padx=(0, 10), pady=6)
+        exc_cb = ttk.Combobox(frm, textvariable=exchange_var, values=["ROBINHOOD", "BYBIT"], state="readonly")
+        exc_cb.grid(row=r, column=1, sticky="ew", pady=6)
+        r += 1
 
+        add_row(r, "Hub data dir (optional):", hub_dir_var, browse="dir"); r += 1
+        
         ttk.Separator(frm, orient="horizontal").grid(row=r, column=0, columnspan=3, sticky="ew", pady=10); r += 1
 
         add_row(r, "pt_thinker.py path:", neural_script_var); r += 1
         add_row(r, "pt_trainer.py path:", trainer_script_var); r += 1
         add_row(r, "pt_trader.py path:", trader_script_var); r += 1
+
+        # --- Bybit API Section ---
+        ttk.Separator(frm, orient="horizontal").grid(row=r, column=0, columnspan=3, sticky="ew", pady=10); r += 1
+        
+        def _get_bybit_status():
+             bk = os.path.join(self.project_dir, "b_key.txt")
+             bs = os.path.join(self.project_dir, "b_secret.txt")
+             if os.path.exists(bk) and os.path.exists(bs): return "Configured ✅"
+             return "Not configured ❌"
+        
+        bybit_status_var = tk.StringVar(value=_get_bybit_status())
+        
+        def _refresh_bybit_status():
+            bybit_status_var.set(_get_bybit_status())
+
+        ttk.Label(frm, text="Bybit API:").grid(row=r, column=0, sticky="w", padx=(0, 10), pady=6)
+        bb_row = ttk.Frame(frm)
+        bb_row.grid(row=r, column=1, columnspan=2, sticky="ew", pady=6)
+        ttk.Label(bb_row, textvariable=bybit_status_var).pack(side="left")
+        ttk.Button(bb_row, text="Setup", command=_open_bybit_api_wizard).pack(side="left", padx=10)
+        
+        r += 1
 
         # --- Robinhood API setup (writes r_key.txt + r_secret.txt used by pt_trader.py) ---
         def _api_paths() -> Tuple[str, str]:
@@ -4440,6 +4562,9 @@ class PowerTraderHub(tk.Tk):
 
             _refresh_api_status()
             messagebox.showinfo("Deleted", "Deleted r_key.txt and r_secret.txt.")
+
+
+
 
         def _open_robinhood_api_wizard() -> None:
             """
@@ -4985,6 +5110,9 @@ class PowerTraderHub(tk.Tk):
                 self.settings["script_neural_runner2"] = neural_script_var.get().strip()
                 self.settings["script_neural_trainer"] = trainer_script_var.get().strip()
                 self.settings["script_trader"] = trader_script_var.get().strip()
+                
+                self.settings["exchange"] = exchange_var.get()
+
 
                 self.settings["ui_refresh_seconds"] = float(ui_refresh_var.get().strip())
                 self.settings["chart_refresh_seconds"] = float(chart_refresh_var.get().strip())

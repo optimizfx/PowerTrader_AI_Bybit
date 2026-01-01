@@ -1593,6 +1593,8 @@ while True:
 					price_change_list = []
 					current_pattern = []
 					break
+				except SystemExit:
+					raise
 				except:
 					PrintException()
 					while True:

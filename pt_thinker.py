@@ -4,6 +4,7 @@ import random
 import requests
 from kucoin.client import Market
 market = Market(url='https://api.kucoin.com')
+from pybit.unified_trading import HTTP
 import sys
 import datetime
 import traceback
@@ -87,33 +88,85 @@ class RobinhoodMarketData:
         # EXACTLY like rhcb.py's get_price(): ask_inclusive_of_buy_spread
         return float(result["ask_inclusive_of_buy_spread"])
 
+class BybitMarketData:
+    def __init__(self, api_key: str, api_secret: str, demo: bool = False):
+        self.session = HTTP(
+            demo=demo,
+            api_key=api_key,
+            api_secret=api_secret,
+        )
 
-def robinhood_current_ask(symbol: str) -> float:
+    def get_current_ask(self, symbol: str) -> float:
+        # Symbol format needed: BTC-USD -> BTCUSDT
+        sym_bb = symbol.replace("-USD", "USDT")
+        try:
+            resp = self.session.get_tickers(category="spot", symbol=sym_bb)
+            # result.list[0].ask1Price
+            val = resp['result']['list'][0]['ask1Price']
+            if not val: # Handle empty string
+                 last = resp['result']['list'][0]['lastPrice']
+                 if last:
+                     return float(last)
+                 raise ValueError(f"No ask1Price or lastPrice for {symbol}")
+            return float(val)
+        except Exception as e:
+            raise RuntimeError(f"Bybit get_tickers failed for {symbol}: {e}")
+
+
+
+def get_current_ask(symbol: str) -> float:
     """
-    Returns Robinhood current BUY price (ask_inclusive_of_buy_spread) for symbols like 'BTC-USD'.
-    Reads creds from r_key.txt and r_secret.txt in the same folder as this script.
+    Returns current BUY price (ASK) for symbols like 'BTC-USD'.
+    Dispatches to Robinhood or Bybit based on settings.
     """
     global _RH_MD
-    if _RH_MD is None:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        key_path = os.path.join(base_dir, "r_key.txt")
-        secret_path = os.path.join(base_dir, "r_secret.txt")
+    
+    # Load settings to check active exchange
+    settings = _load_gui_settings()
+    exchange = settings.get("exchange", "ROBINHOOD")
+    
+    if exchange == "BYBIT":
+        # Check if we have a cached Bybit MD instance or need to create
+        # Re-using _RH_MD variable name for generic MD instance to avoid broad refactor
+        if _RH_MD is None or not isinstance(_RH_MD, BybitMarketData):
+             base_dir = os.path.dirname(os.path.abspath(__file__))
+             key_path = os.path.join(base_dir, "b_key.txt")
+             secret_path = os.path.join(base_dir, "b_secret.txt")
+             
+             if not os.path.isfile(key_path) or not os.path.isfile(secret_path):
+                 raise RuntimeError("Missing b_key.txt/b_secret.txt for Bybit.")
+                 
+             with open(key_path, "r", encoding="utf-8") as f:
+                api_key = f.read().strip()
+             with open(secret_path, "r", encoding="utf-8") as f:
+                api_secret = f.read().strip()
+                
+             _RH_MD = BybitMarketData(api_key, api_secret, demo=settings.get("bybit_demo", False))
+             
+        return _RH_MD.get_current_ask(symbol)
+        
+    else:
+        # Default Robinhood
+        if _RH_MD is None or not isinstance(_RH_MD, RobinhoodMarketData):
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            key_path = os.path.join(base_dir, "r_key.txt")
+            secret_path = os.path.join(base_dir, "r_secret.txt")
 
-        if not os.path.isfile(key_path) or not os.path.isfile(secret_path):
-            raise RuntimeError(
-                "Missing r_key.txt and/or r_secret.txt next to pt_thinker.py. "
-                "Run pt_trader.py once to create them (and to set your Robinhood API key)."
-            )
+            if not os.path.isfile(key_path) or not os.path.isfile(secret_path):
+                raise RuntimeError(
+                    "Missing r_key.txt and/or r_secret.txt next to pt_thinker.py. "
+                    "Run pt_hub.py / pt_trader.py once to create them."
+                )
 
+            with open(key_path, "r", encoding="utf-8") as f:
+                api_key = f.read()
+            with open(secret_path, "r", encoding="utf-8") as f:
+                priv_b64 = f.read()
 
-        with open(key_path, "r", encoding="utf-8") as f:
-            api_key = f.read()
-        with open(secret_path, "r", encoding="utf-8") as f:
-            priv_b64 = f.read()
+            _RH_MD = RobinhoodMarketData(api_key=api_key, base64_private_key=priv_b64)
 
-        _RH_MD = RobinhoodMarketData(api_key=api_key, base64_private_key=priv_b64)
+        return _RH_MD.get_current_ask(symbol)
 
-    return _RH_MD.get_current_ask(symbol)
 
 
 def restart_program():
@@ -157,20 +210,20 @@ _GUI_SETTINGS_PATH = os.environ.get("POWERTRADER_GUI_SETTINGS") or os.path.join(
 _gui_settings_cache = {
 	"mtime": None,
 	"coins": ['BTC', 'ETH', 'XRP', 'BNB', 'DOGE'],  # fallback defaults
+    "exchange": "ROBINHOOD",
+    "bybit_demo": False
 }
 
-def _load_gui_coins() -> list:
-	"""
-	Reads gui_settings.json and returns settings["coins"] as an uppercased list.
-	Caches by mtime so it is cheap to call frequently.
-	"""
+def _load_gui_settings() -> dict:
+    # Renamed from _load_gui_coins for clarity, but keeping compat if needed
+    # Returns the full dict
 	try:
 		if not os.path.isfile(_GUI_SETTINGS_PATH):
-			return list(_gui_settings_cache["coins"])
+			return dict(_gui_settings_cache)
 
 		mtime = os.path.getmtime(_GUI_SETTINGS_PATH)
 		if _gui_settings_cache["mtime"] == mtime:
-			return list(_gui_settings_cache["coins"])
+			return dict(_gui_settings_cache)
 
 		with open(_GUI_SETTINGS_PATH, "r", encoding="utf-8") as f:
 			data = json.load(f) or {}
@@ -185,9 +238,17 @@ def _load_gui_coins() -> list:
 
 		_gui_settings_cache["mtime"] = mtime
 		_gui_settings_cache["coins"] = coins
-		return list(coins)
+		_gui_settings_cache["exchange"] = data.get("exchange", "ROBINHOOD")
+		_gui_settings_cache["bybit_demo"] = data.get("bybit_demo", False)
+		_gui_settings_cache["main_neural_dir"] = data.get("main_neural_dir", None)
+        
+		return dict(_gui_settings_cache)
 	except Exception:
-		return list(_gui_settings_cache["coins"])
+		return dict(_gui_settings_cache)
+
+def _load_gui_coins() -> list:
+    return _load_gui_settings()["coins"]
+
 
 # Initial coin list (will be kept live via _sync_coins_from_settings())
 COIN_SYMBOLS = _load_gui_coins()
@@ -197,8 +258,19 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def coin_folder(sym: str) -> str:
 	sym = sym.upper()
-	# Your "main folder is BTC folder" convention:
-	return BASE_DIR if sym == 'BTC' else os.path.join(BASE_DIR, sym)
+	
+	# Load latest settings to see if user effectively changed the 'root'
+	# Note: This means we check settings on every call, 
+	# but _load_gui_settings has mtime caching so it's fast.
+	s = _load_gui_settings()
+	root = s.get("main_neural_dir")
+	if not root or not os.path.isdir(root):
+		root = BASE_DIR
+
+	# Convention:
+	# BTC -> root
+	# Others -> root/DOGE
+	return root if sym == 'BTC' else os.path.join(root, sym)
 
 
 # --- training freshness gate (mirrors pt_hub.py) ---
@@ -497,7 +569,7 @@ def step_coin(sym: str):
 		except Exception:
 			pass
 		try:
-			display_cache[sym] = sym + "  (NOT TRAINED / OUTDATED - run trainer)"
+			display_cache[sym] = sym + f"  (NOT TRAINED at {folder} - Check timestamp/path)"
 		except Exception:
 			pass
 		try:
@@ -734,9 +806,10 @@ def step_coin(sym: str):
 		rh_symbol = f"{sym}-USD"
 		while True:
 			try:
-				current = robinhood_current_ask(rh_symbol)
+				current = get_current_ask(rh_symbol)
 				break
-			except Exception:
+			except Exception as e:
+				print(f"Error fetching {rh_symbol}, retrying... {e}")
 				time.sleep(1)
 				continue
 

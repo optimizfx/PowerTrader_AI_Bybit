@@ -1,0 +1,24 @@
+
+/__pycache__
+/hub_data
+/training_data
+
+# API KEYS
+b_key.txt
+b_secret.txt
+
+alerts_version.txt
+long_dca_signal.txt
+short_dca_signal.txt
+futures_long_onoff.txt
+futures_short_onoff.txt
+futures_long_profit_margin.txt
+futures_short_profit_margin.txt
+
+gui_settings.json
+
+# Common coins to ignore:
+/BNB
+/DOGE
+/XRP
+/ETH
