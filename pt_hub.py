@@ -271,9 +271,8 @@ class NeuralSignalTile(ttk.Frame):
 # -----------------------------
 
 DEFAULT_SETTINGS = {
-    "main_neural_dir": r"C:\PowerTrader_AI",
     "coins": ["BTC", "ETH", "XRP", "BNB", "DOGE"],
-    "exchange": "ROBINHOOD",
+    "exchange": "BYBIT",
     "bybit_demo": False,
     "default_timeframe": "1hour",
     "timeframes": [
@@ -289,6 +288,7 @@ DEFAULT_SETTINGS = {
     "script_neural_trainer": "pt_trainer.py",
     "script_trader": "pt_trader.py",
     "auto_start_scripts": False,
+    "use_gpu": False,
 }
 
 
@@ -412,36 +412,38 @@ def _now_str() -> str:
 # Neural folder detection
 # -----------------------------
 
-def build_coin_folders(main_dir: str, coins: List[str]) -> Dict[str, str]:
+def build_coin_folders(coins: List[str]) -> Dict[str, str]:
     """
-    Mirrors your convention:
-      BTC uses main_dir directly
-      other coins typically have subfolders inside main_dir (auto-detected)
-
+    Uses a FIXED training_data folder structure:
+      - ALL coins (including BTC) use training_data/{COIN}/ subfolders
+    
+    This eliminates path confusion and ensures all scripts read/write to the same location.
+    
     Returns { "BTC": "...", "ETH": "...", ... }
     """
     out: Dict[str, str] = {}
-    main_dir = main_dir or os.getcwd()
-
-    # BTC folder
-    out["BTC"] = main_dir
-
-    # Auto-detect subfolders
-    if os.path.isdir(main_dir):
-        for name in os.listdir(main_dir):
-            p = os.path.join(main_dir, name)
-            if not os.path.isdir(p):
-                continue
-            sym = name.upper().strip()
-            if sym in coins and sym != "BTC":
-                out[sym] = p
-
-    # Fallbacks for missing ones
+    
+    # Get the project directory (where pt_hub.py lives)
+    project_dir = os.path.abspath(os.path.dirname(__file__)) if "__file__" in globals() else os.getcwd()
+    training_data_dir = os.path.join(project_dir, "training_data")
+    
+    # Ensure training_data directory exists
+    try:
+        os.makedirs(training_data_dir, exist_ok=True)
+    except Exception:
+        pass
+    
+    # All coins get subfolders
     for c in coins:
         c = c.upper().strip()
-        if c not in out:
-            out[c] = os.path.join(main_dir, c)  # best-effort fallback
-
+        coin_folder = os.path.join(training_data_dir, c)
+        out[c] = coin_folder
+        # Ensure subfolder exists
+        try:
+            os.makedirs(coin_folder, exist_ok=True)
+        except Exception:
+            pass
+    
     return out
 
 
@@ -1519,7 +1521,7 @@ class PowerTraderHub(tk.Tk):
         self._ensure_alt_coin_folders_and_trainer_on_startup()
 
         # Rebuild folder map after potential folder creation
-        self.coin_folders = build_coin_folders(self.settings["main_neural_dir"], self.coins)
+        self.coin_folders = build_coin_folders(self.coins)
 
 
         # scripts
@@ -1823,22 +1825,25 @@ class PowerTraderHub(tk.Tk):
         """
         try:
             coins = [str(c).strip().upper() for c in (self.settings.get("coins") or []) if str(c).strip()]
-            main_dir = (self.settings.get("main_neural_dir") or self.project_dir or os.getcwd()).strip()
+            training_data_dir = os.path.join(self.project_dir, "training_data")
 
-            trainer_name = os.path.basename(str(self.settings.get("script_neural_trainer", "neural_trainer.py")))
+            trainer_name = os.path.basename(str(self.settings.get("script_neural_trainer", "pt_trainer.py")))
 
-            # Source trainer: MAIN folder (BTC folder)
-            src_main_trainer = os.path.join(main_dir, trainer_name)
-
-            # Best-effort fallback if the main folder doesn't have it (keeps behavior robust)
-            src_cfg_trainer = str(self.settings.get("script_neural_trainer", trainer_name))
-            src_trainer_path = src_main_trainer if os.path.isfile(src_main_trainer) else src_cfg_trainer
+            # Source trainer: Try project root (where development/original script lives)
+            src_options = [
+                os.path.join(self.project_dir, trainer_name)
+            ]
+            
+            # If not in project root, maybe it's already in training_data/BTC (if it exists)
+            training_data_dir = os.path.join(self.project_dir, "training_data")
+            src_options.append(os.path.join(training_data_dir, "BTC", trainer_name))
+            
+            src_trainer_path = next((p for p in src_options if os.path.isfile(p)), None)
+            if not src_trainer_path:
+                return
 
             for coin in coins:
-                if coin == "BTC":
-                    continue  # BTC uses main folder; no per-coin folder needed
-
-                coin_dir = os.path.join(main_dir, coin)
+                coin_dir = os.path.join(training_data_dir, coin)
 
                 created = False
                 if not os.path.isdir(coin_dir):
@@ -1848,7 +1853,7 @@ class PowerTraderHub(tk.Tk):
                 # Only copy into folders created at startup (per your request)
                 if created:
                     dst_trainer_path = os.path.join(coin_dir, trainer_name)
-                    if (not os.path.isfile(dst_trainer_path)) and os.path.isfile(src_trainer_path):
+                    if not os.path.isfile(dst_trainer_path):
                         shutil.copy2(src_trainer_path, dst_trainer_path)
         except Exception:
             pass
@@ -2050,6 +2055,20 @@ class PowerTraderHub(tk.Tk):
 
         self.train_coin_combo.bind("<<ComboboxSelected>>", _sync_train_coin)
         _sync_train_coin()
+
+        # GPU Option
+        self.gpu_var = tk.BooleanVar(value=bool(self.settings.get("use_gpu", False)))
+        def _on_gpu_changed():
+            self.settings["use_gpu"] = self.gpu_var.get()
+            self._save_settings()
+            
+        self.chk_gpu = ttk.Checkbutton(
+            training_left, 
+            text="Use NVIDIA GPU (if available)", 
+            variable=self.gpu_var,
+            command=_on_gpu_changed
+        )
+        self.chk_gpu.pack(anchor="w", padx=6, pady=(4, 0))
 
 
 
@@ -2556,10 +2575,10 @@ class PowerTraderHub(tk.Tk):
                             try:
                                 # Ensure coin folders exist (best-effort; fast)
                                 try:
-                                    cf_sig = (self.settings.get("main_neural_dir"), tuple(self.coins))
+                                    cf_sig = tuple(self.coins)
                                     if getattr(self, "_coin_folders_sig", None) != cf_sig:
                                         self._coin_folders_sig = cf_sig
-                                        self.coin_folders = build_coin_folders(self.settings["main_neural_dir"], self.coins)
+                                        self.coin_folders = build_coin_folders(self.coins)
                                 except Exception:
                                     pass
 
@@ -3207,18 +3226,43 @@ class PowerTraderHub(tk.Tk):
         if not coin:
             return
         # Reuse the trainers pane runner — start trainer for selected coin
-        self.start_trainer_for_selected_coin()
+        self.start_trainer_for_selected_coin(force=True)
 
     def train_all_coins(self) -> None:
         # Start trainers for every coin (in parallel)
         for c in self.coins:
             self.trainer_coin_var.set(c)
-            self.start_trainer_for_selected_coin()
+            self.start_trainer_for_selected_coin(force=False)
 
-    def start_trainer_for_selected_coin(self) -> None:
+    def start_trainer_for_selected_coin(self, force: bool = True) -> None:
         coin = (self.trainer_coin_var.get() or "").strip().upper()
         if not coin:
             return
+
+        # --- FRESHNESS CHECK ---
+        # If not forcing, skip if trained within the last 4 hours and memory files exist.
+        if not force:
+            coin_cwd = self.coin_folders.get(coin, self.project_dir)
+            last_train_file = os.path.join(coin_cwd, "trainer_last_training_time.txt")
+            if os.path.exists(last_train_file):
+                try:
+                    with open(last_train_file, "r") as f:
+                        ts_str = f.read().strip()
+                        if ts_str:
+                            ts = int(ts_str)
+                            # 4 hours threshold
+                            if (time.time() - ts) < (4 * 3600):
+                                # Ensure at least some memory weights exist
+                                if glob.glob(os.path.join(coin_cwd, "memory_weights_*.txt")):
+                                    msg = f"Skipping {coin} training; already fresh (< 4h)."
+                                    print(msg)
+                                    try:
+                                        self.status.config(text=msg)
+                                    except:
+                                        pass
+                                    return
+                except Exception:
+                    pass
 
         # Stop the Neural Runner before any training starts (training modifies artifacts the runner reads)
         self.stop_neural()
@@ -3229,27 +3273,31 @@ class PowerTraderHub(tk.Tk):
         #   Alts run from their own coin subfolder
         coin_cwd = self.coin_folders.get(coin, self.project_dir)
 
-        # Use the trainer script that lives INSIDE that coin's folder so outputs land in the right place.
+        # Use the trainer script name from settings
         trainer_name = os.path.basename(str(self.settings.get("script_neural_trainer", "pt_trainer.py")))
 
-        # If an alt coin folder doesn't exist yet, create it and copy the trainer script from the main (BTC) folder.
-        # (Also: overwrite to avoid running stale trainer copies in alt folders.)
+        # 1) Correctly identify the SOURCE trainer script by checking both the BTC folder and the project directory.
+        src_main_folder = self.coin_folders.get("BTC", self.project_dir)
+        src_options = [
+            os.path.join(src_main_folder, trainer_name),
+            os.path.join(self.project_dir, trainer_name)
+        ]
+        src_trainer_path = next((p for p in src_options if os.path.isfile(p)), None)
 
-        if coin != "BTC":
+        # 2) Ensure the target directory exists (especially important for non-BTC coins)
+        try:
+            if not os.path.exists(coin_cwd):
+                os.makedirs(coin_cwd, exist_ok=True)
+        except Exception:
+            pass
+
+        # 3) Copy the trainer script to the target folder if it's missing.
+        trainer_path = os.path.join(coin_cwd, trainer_name)
+        if src_trainer_path and not os.path.isfile(trainer_path):
             try:
-                if not os.path.isdir(coin_cwd):
-                    os.makedirs(coin_cwd, exist_ok=True)
-
-                src_main_folder = self.coin_folders.get("BTC", self.project_dir)
-                src_trainer_path = os.path.join(src_main_folder, trainer_name)
-                dst_trainer_path = os.path.join(coin_cwd, trainer_name)
-
-                if os.path.isfile(src_trainer_path):
-                    shutil.copy2(src_trainer_path, dst_trainer_path)
+                shutil.copy2(src_trainer_path, trainer_path)
             except Exception:
                 pass
-
-        trainer_path = os.path.join(coin_cwd, trainer_name)
 
         if not os.path.isfile(trainer_path):
             messagebox.showerror(
@@ -3299,8 +3347,12 @@ class PowerTraderHub(tk.Tk):
 
         try:
             # IMPORTANT: pass `coin` so neural_trainer trains the correct market instead of defaulting to BTC
+            cmd = [sys.executable, "-u", info.path, coin]
+            if bool(self.settings.get("use_gpu", False)):
+                cmd.append("--gpu")
+                
             info.proc = subprocess.Popen(
-                [sys.executable, "-u", info.path, coin],
+                cmd,
                 cwd=coin_cwd,
                 env=env,
                 stdout=subprocess.PIPE,
@@ -3358,7 +3410,7 @@ class PowerTraderHub(tk.Tk):
             if not coin:
                 return
 
-            self.coin_folders = build_coin_folders(self.settings["main_neural_dir"], self.coins)
+            self.coin_folders = build_coin_folders(self.coins)
 
             pos = self._last_positions.get(coin, {}) if isinstance(self._last_positions, dict) else {}
             buy_px = pos.get("current_buy_price", None)
@@ -3424,6 +3476,22 @@ class PowerTraderHub(tk.Tk):
         # --- flow gating: Train -> Start All ---
         status_map = self._training_status_map()
         all_trained = all(v == "TRAINED" for v in status_map.values()) if status_map else False
+
+        # Detect training completion transitions and refresh coin_folders when training finishes
+        # This allows "Start All" to work immediately after training without restart
+        try:
+            # Store previous status map to detect transitions
+            prev_status = getattr(self, "_last_training_status_map", {})
+            if prev_status != status_map:
+                # Check if any coin transitioned from TRAINING to TRAINED
+                for coin, status in status_map.items():
+                    if status == "TRAINED" and prev_status.get(coin) == "TRAINING":
+                        # Training just completed - rebuild coin_folders to pick up new data
+                        self.coin_folders = build_coin_folders(self.coins)
+                        break
+            self._last_training_status_map = status_map
+        except Exception:
+            pass
 
         # Disable Start All until training is done (but always allow it if something is already running/pending,
         # so the user can still stop everything).
@@ -3493,13 +3561,13 @@ class PowerTraderHub(tk.Tk):
 
             # Only rebuild coin_folders when inputs change (avoids directory scans every refresh)
             try:
-                cf_sig = (self.settings.get("main_neural_dir"), tuple(self.coins))
+                cf_sig = tuple(self.coins)
                 if getattr(self, "_coin_folders_sig", None) != cf_sig:
                     self._coin_folders_sig = cf_sig
-                    self.coin_folders = build_coin_folders(self.settings["main_neural_dir"], self.coins)
+                    self.coin_folders = build_coin_folders(self.coins)
             except Exception:
                 try:
-                    self.coin_folders = build_coin_folders(self.settings["main_neural_dir"], self.coins)
+                    self.coin_folders = build_coin_folders(self.coins)
                 except Exception:
                     pass
 
@@ -3890,7 +3958,7 @@ class PowerTraderHub(tk.Tk):
         """
         # Rebuild dependent pieces
         self.coins = [c.upper().strip() for c in (self.settings.get("coins") or []) if c.strip()]
-        self.coin_folders = build_coin_folders(self.settings.get("main_neural_dir") or self.project_dir, self.coins)
+        self.coin_folders = build_coin_folders(self.coins)
 
         # Refresh coin dropdowns (they don't auto-update)
         try:
@@ -4037,10 +4105,10 @@ class PowerTraderHub(tk.Tk):
 
         # Keep coin_folders aligned with current settings/coins
         try:
-            sig = (str(self.settings.get("main_neural_dir") or ""), tuple(self.coins or []))
+            sig = tuple(self.coins or [])
             if getattr(self, "_coin_folders_sig", None) != sig:
                 self._coin_folders_sig = sig
-                self.coin_folders = build_coin_folders(self.settings.get("main_neural_dir") or self.project_dir, self.coins)
+                self.coin_folders = build_coin_folders(self.coins)
         except Exception:
             pass
 
@@ -4432,8 +4500,9 @@ class PowerTraderHub(tk.Tk):
             ttk.Button(btn_frame, text="Cancel", command=wiz.destroy).pack(side="left", padx=5)
 
 
-        main_dir_var = tk.StringVar(value=self.settings["main_neural_dir"])
         coins_var = tk.StringVar(value=",".join(self.settings["coins"]))
+        exchange_var = tk.StringVar(value=self.settings.get("exchange", "BYBIT"))
+        r = 0
         hub_dir_var = tk.StringVar(value=self.settings.get("hub_data_dir", ""))
 
         neural_script_var = tk.StringVar(value=self.settings["script_neural_runner2"])
@@ -4445,16 +4514,12 @@ class PowerTraderHub(tk.Tk):
         candles_limit_var = tk.StringVar(value=str(self.settings["candles_limit"]))
         auto_start_var = tk.BooleanVar(value=bool(self.settings.get("auto_start_scripts", False)))
 
-        exchange_var = tk.StringVar(value=self.settings.get("exchange", "ROBINHOOD"))
+        add_row(r, "Choose which coins to trade:", coins_var); r += 1
 
-        r = 0
-        add_row(r, "Main neural folder:", main_dir_var, browse="dir"); r += 1
-        add_row(r, "Coins (comma):", coins_var); r += 1
-        
-        # Exchange Selection
         ttk.Label(frm, text="Exchange:").grid(row=r, column=0, sticky="w", padx=(0, 10), pady=6)
-        exc_cb = ttk.Combobox(frm, textvariable=exchange_var, values=["ROBINHOOD", "BYBIT"], state="readonly")
+        exc_cb = ttk.Combobox(frm, textvariable=exchange_var, values=["BYBIT"], state="readonly")
         exc_cb.grid(row=r, column=1, sticky="ew", pady=6)
+        
         r += 1
 
         add_row(r, "Hub data dir (optional):", hub_dir_var, browse="dir"); r += 1
@@ -4487,607 +4552,6 @@ class PowerTraderHub(tk.Tk):
         
         r += 1
 
-        # --- Robinhood API setup (writes r_key.txt + r_secret.txt used by pt_trader.py) ---
-        def _api_paths() -> Tuple[str, str]:
-            key_path = os.path.join(self.project_dir, "r_key.txt")
-            secret_path = os.path.join(self.project_dir, "r_secret.txt")
-            return key_path, secret_path
-
-        def _read_api_files() -> Tuple[str, str]:
-            key_path, secret_path = _api_paths()
-            try:
-                with open(key_path, "r", encoding="utf-8") as f:
-                    k = (f.read() or "").strip()
-            except Exception:
-                k = ""
-            try:
-                with open(secret_path, "r", encoding="utf-8") as f:
-                    s = (f.read() or "").strip()
-            except Exception:
-                s = ""
-            return k, s
-
-        api_status_var = tk.StringVar(value="")
-
-        def _refresh_api_status() -> None:
-            key_path, secret_path = _api_paths()
-            k, s = _read_api_files()
-
-            missing = []
-            if not k:
-                missing.append("r_key.txt (API Key)")
-            if not s:
-                missing.append("r_secret.txt (PRIVATE key)")
-
-            if missing:
-                api_status_var.set("Not configured ❌ (missing " + ", ".join(missing) + ")")
-            else:
-                api_status_var.set("Configured ✅ (credentials found)")
-
-        def _open_api_folder() -> None:
-            """Open the folder where r_key.txt / r_secret.txt live."""
-            try:
-                folder = os.path.abspath(self.project_dir)
-                if os.name == "nt":
-                    os.startfile(folder)  # type: ignore[attr-defined]
-                    return
-                if sys.platform == "darwin":
-                    subprocess.Popen(["open", folder])
-                    return
-                subprocess.Popen(["xdg-open", folder])
-            except Exception as e:
-                messagebox.showerror("Couldn't open folder", f"Tried to open:\n{self.project_dir}\n\nError:\n{e}")
-
-        def _clear_api_files() -> None:
-            """Delete r_key.txt / r_secret.txt (with a big confirmation)."""
-            key_path, secret_path = _api_paths()
-            if not messagebox.askyesno(
-                "Delete API credentials?",
-                "This will delete:\n"
-                f"  {key_path}\n"
-                f"  {secret_path}\n\n"
-                "After deleting, the trader can NOT authenticate until you run the setup wizard again.\n\n"
-                "Are you sure you want to delete these files?"
-            ):
-                return
-
-            try:
-                if os.path.isfile(key_path):
-                    os.remove(key_path)
-                if os.path.isfile(secret_path):
-                    os.remove(secret_path)
-            except Exception as e:
-                messagebox.showerror("Delete failed", f"Couldn't delete the files:\n\n{e}")
-                return
-
-            _refresh_api_status()
-            messagebox.showinfo("Deleted", "Deleted r_key.txt and r_secret.txt.")
-
-
-
-
-        def _open_robinhood_api_wizard() -> None:
-            """
-            Beginner-friendly wizard that creates + stores Robinhood Crypto Trading API credentials.
-
-            What we store:
-              - r_key.txt    = your Robinhood *API Key* (safe-ish to store, still treat as sensitive)
-              - r_secret.txt = your *PRIVATE key* (treat like a password — never share it)
-            """
-            import webbrowser
-            import base64
-            import platform
-            from datetime import datetime
-            import time
-
-            # Friendly dependency errors (laymen-proof)
-            try:
-                from cryptography.hazmat.primitives.asymmetric import ed25519
-                from cryptography.hazmat.primitives import serialization
-            except Exception:
-                messagebox.showerror(
-                    "Missing dependency",
-                    "The 'cryptography' package is required for Robinhood API setup.\n\n"
-                    "Fix: open a Command Prompt / Terminal in this folder and run:\n"
-                    "  pip install cryptography\n\n"
-                    "Then re-open this Setup Wizard."
-                )
-                return
-
-            try:
-                import requests  # for the 'Test credentials' button
-            except Exception:
-                requests = None
-
-            wiz = tk.Toplevel(win)
-            wiz.title("Robinhood API Setup")
-            # Big enough to show the bottom buttons, but still scrolls if the window is resized smaller.
-            wiz.geometry("980x720")
-            wiz.minsize(860, 620)
-            wiz.configure(bg=DARK_BG)
-
-            # Scrollable content area (same pattern as the Neural Levels scrollbar).
-            viewport = ttk.Frame(wiz)
-            viewport.pack(fill="both", expand=True, padx=12, pady=12)
-            viewport.grid_rowconfigure(0, weight=1)
-            viewport.grid_columnconfigure(0, weight=1)
-
-            wiz_canvas = tk.Canvas(
-                viewport,
-                bg=DARK_BG,
-                highlightthickness=1,
-                highlightbackground=DARK_BORDER,
-                bd=0,
-            )
-            wiz_canvas.grid(row=0, column=0, sticky="nsew")
-
-            wiz_scroll = ttk.Scrollbar(viewport, orient="vertical", command=wiz_canvas.yview)
-            wiz_scroll.grid(row=0, column=1, sticky="ns")
-            wiz_canvas.configure(yscrollcommand=wiz_scroll.set)
-
-            container = ttk.Frame(wiz_canvas)
-            wiz_window = wiz_canvas.create_window((0, 0), window=container, anchor="nw")
-            container.columnconfigure(0, weight=1)
-
-            def _update_wiz_scrollbars(event=None) -> None:
-                """Update scrollregion + hide/show the scrollbar depending on overflow."""
-                try:
-                    c = wiz_canvas
-                    win_id = wiz_window
-
-                    c.update_idletasks()
-                    bbox = c.bbox(win_id)
-                    if not bbox:
-                        wiz_scroll.grid_remove()
-                        return
-
-                    c.configure(scrollregion=bbox)
-                    content_h = int(bbox[3] - bbox[1])
-                    view_h = int(c.winfo_height())
-
-                    if content_h > (view_h + 1):
-                        wiz_scroll.grid()
-                    else:
-                        wiz_scroll.grid_remove()
-                        try:
-                            c.yview_moveto(0)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-
-            def _on_wiz_canvas_configure(e) -> None:
-                # Keep the inner frame exactly the canvas width so labels wrap nicely.
-                try:
-                    wiz_canvas.itemconfigure(wiz_window, width=int(e.width))
-                except Exception:
-                    pass
-                _update_wiz_scrollbars()
-
-            wiz_canvas.bind("<Configure>", _on_wiz_canvas_configure, add="+")
-            container.bind("<Configure>", _update_wiz_scrollbars, add="+")
-
-            def _wheel(e):
-                try:
-                    if wiz_scroll.winfo_ismapped():
-                        wiz_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-                except Exception:
-                    pass
-
-            wiz_canvas.bind("<Enter>", lambda _e: wiz_canvas.focus_set(), add="+")
-            wiz_canvas.bind("<MouseWheel>", _wheel, add="+")  # Windows / Mac
-            wiz_canvas.bind("<Button-4>", lambda _e: wiz_canvas.yview_scroll(-3, "units"), add="+")  # Linux
-            wiz_canvas.bind("<Button-5>", lambda _e: wiz_canvas.yview_scroll(3, "units"), add="+")   # Linux
-
-
-            key_path, secret_path = _api_paths()
-
-            # Load any existing credentials so users can update without re-generating keys.
-            existing_api_key, existing_private_b64 = _read_api_files()
-            private_b64_state = {"value": (existing_private_b64 or "").strip()}
-
-            # -----------------------------
-            # Helpers (open folder, copy, etc.)
-            # -----------------------------
-            def _open_in_file_manager(path: str) -> None:
-                try:
-                    p = os.path.abspath(path)
-                    if os.name == "nt":
-                        os.startfile(p)  # type: ignore[attr-defined]
-                        return
-                    if sys.platform == "darwin":
-                        subprocess.Popen(["open", p])
-                        return
-                    subprocess.Popen(["xdg-open", p])
-                except Exception as e:
-                    messagebox.showerror("Couldn't open folder", f"Tried to open:\n{path}\n\nError:\n{e}")
-
-            def _copy_to_clipboard(txt: str, title: str = "Copied") -> None:
-                try:
-                    wiz.clipboard_clear()
-                    wiz.clipboard_append(txt)
-                    messagebox.showinfo(title, "Copied to clipboard.")
-                except Exception:
-                    pass
-
-            def _mask_path(p: str) -> str:
-                try:
-                    return os.path.abspath(p)
-                except Exception:
-                    return p
-
-            # -----------------------------
-            # Big, beginner-friendly instructions
-            # -----------------------------
-            intro = (
-                "This trader uses Robinhood's Crypto Trading API credentials.\n\n"
-                "You only do this once. When finished, pt_trader.py can authenticate automatically.\n\n"
-                "✅ What you will do in this window:\n"
-                "  1) Generate a Public Key + Private Key (Ed25519).\n"
-                "  2) Copy the PUBLIC key and paste it into Robinhood to create an API credential.\n"
-                "  3) Robinhood will show you an API Key (usually starts with 'rh...'). Copy it.\n"
-                "  4) Paste that API Key back here and click Save.\n\n"
-                "🧭 EXACTLY where to paste the Public Key on Robinhood (desktop web is best):\n"
-                "  A) Log in to Robinhood on a computer.\n"
-                "  B) Click Account (top-right) → Settings.\n"
-                "  C) Click Crypto.\n"
-                "  D) Scroll down to API Trading and click + Add Key (or Add key).\n"
-                "  E) Paste the Public Key into the Public key field.\n"
-                "  F) Give it any name (example: PowerTrader).\n"
-                "  G) Permissions: this TRADER needs READ + TRADE. (READ-only cannot place orders.)\n"
-                "  H) Click Save. Robinhood shows your API Key — copy it right away (it may only show once).\n\n"
-                "📱 Mobile note: if you can't find API Trading in the app, use robinhood.com in a browser.\n\n"
-                "This wizard will save two files in the same folder as pt_hub.py:\n"
-                "  - r_key.txt    (your API Key)\n"
-                "  - r_secret.txt (your PRIVATE key in base64)  ← keep this secret like a password\n"
-            )
-
-            intro_lbl = ttk.Label(container, text=intro, justify="left")
-            intro_lbl.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-
-            top_btns = ttk.Frame(container)
-            top_btns.grid(row=1, column=0, sticky="ew", pady=(0, 10))
-            top_btns.columnconfigure(0, weight=1)
-
-            def open_robinhood_page():
-                # Robinhood entry point. User will still need to click into Settings → Crypto → API Trading.
-                webbrowser.open("https://robinhood.com/account/crypto")
-
-            ttk.Button(top_btns, text="Open Robinhood API Credentials page (Crypto)", command=open_robinhood_page).pack(side="left")
-            ttk.Button(top_btns, text="Open Robinhood Crypto Trading API docs", command=lambda: webbrowser.open("https://docs.robinhood.com/crypto/trading/")).pack(side="left", padx=8)
-            ttk.Button(top_btns, text="Open Folder With r_key.txt / r_secret.txt", command=lambda: _open_in_file_manager(self.project_dir)).pack(side="left", padx=8)
-
-            # -----------------------------
-            # Step 1 — Generate keys
-            # -----------------------------
-            step1 = ttk.LabelFrame(container, text="Step 1 — Generate your keys (click once)")
-            step1.grid(row=2, column=0, sticky="nsew", pady=(0, 10))
-            step1.columnconfigure(0, weight=1)
-
-            ttk.Label(step1, text="Public Key (this is what you paste into Robinhood):").grid(row=0, column=0, sticky="w", padx=10, pady=(8, 0))
-
-            pub_box = tk.Text(step1, height=4, wrap="none")
-            pub_box.grid(row=1, column=0, sticky="nsew", padx=10, pady=(6, 10))
-            pub_box.configure(bg=DARK_PANEL, fg=DARK_FG, insertbackground=DARK_FG)
-
-            def _render_public_from_private_b64(priv_b64: str) -> str:
-                """Return Robinhood-compatible Public Key: base64(raw_ed25519_public_key_32_bytes)."""
-                try:
-                    raw = base64.b64decode(priv_b64)
-
-                    # Accept either:
-                    #   - 32 bytes: Ed25519 seed
-                    #   - 64 bytes: NaCl/tweetnacl secretKey (seed + public)
-                    if len(raw) == 64:
-                        seed = raw[:32]
-                    elif len(raw) == 32:
-                        seed = raw
-                    else:
-                        return ""
-
-                    pk = ed25519.Ed25519PrivateKey.from_private_bytes(seed)
-                    pub_raw = pk.public_key().public_bytes(
-                        encoding=serialization.Encoding.Raw,
-                        format=serialization.PublicFormat.Raw,
-                    )
-                    return base64.b64encode(pub_raw).decode("utf-8")
-                except Exception:
-                    return ""
-
-            def _set_pub_text(txt: str) -> None:
-                try:
-                    pub_box.delete("1.0", "end")
-                    pub_box.insert("1.0", txt or "")
-                except Exception:
-                    pass
-
-            # If already configured before, show the public key again (derived from stored private key)
-            if private_b64_state["value"]:
-                _set_pub_text(_render_public_from_private_b64(private_b64_state["value"]))
-
-            def generate_keys():
-                # Generate an Ed25519 keypair (Robinhood expects base64 raw public key bytes)
-                priv = ed25519.Ed25519PrivateKey.generate()
-                pub = priv.public_key()
-
-                seed = priv.private_bytes(
-                    encoding=serialization.Encoding.Raw,
-                    format=serialization.PrivateFormat.Raw,
-                    encryption_algorithm=serialization.NoEncryption(),
-                )
-                pub_raw = pub.public_bytes(
-                    encoding=serialization.Encoding.Raw,
-                    format=serialization.PublicFormat.Raw,
-                )
-
-                # Store PRIVATE key as base64(seed32) because pt_thinker.py uses nacl.signing.SigningKey(seed)
-                # and it requires exactly 32 bytes.
-                private_b64_state["value"] = base64.b64encode(seed).decode("utf-8")
-
-                # Show what you paste into Robinhood: base64(raw public key)
-                _set_pub_text(base64.b64encode(pub_raw).decode("utf-8"))
-
-
-                messagebox.showinfo(
-                    "Step 1 complete",
-                    "Public/Private keys generated.\n\n"
-                    "Next (Robinhood):\n"
-                    "  1) Click 'Copy Public Key' in this window\n"
-                    "  2) On Robinhood (desktop web): Account → Settings → Crypto\n"
-                    "  3) Scroll to 'API Trading' → click '+ Add Key'\n"
-                    "  4) Paste the Public Key (base64) into the 'Public key' field\n"
-                    "  5) Enable permissions READ + TRADE (this trader needs both), then Save\n"
-                    "  6) Robinhood shows an API Key (usually starts with 'rh...') — copy it right away\n\n"
-                    "Then come back here and paste that API Key into the 'API Key' box."
-                )
-
-
-
-            def copy_public_key():
-                txt = (pub_box.get("1.0", "end") or "").strip()
-                if not txt:
-                    messagebox.showwarning("Nothing to copy", "Click 'Generate Keys' first.")
-                    return
-                _copy_to_clipboard(txt, title="Public Key copied")
-
-            step1_btns = ttk.Frame(step1)
-            step1_btns.grid(row=2, column=0, sticky="w", padx=10, pady=(0, 10))
-            ttk.Button(step1_btns, text="Generate Keys", command=generate_keys).pack(side="left")
-            ttk.Button(step1_btns, text="Copy Public Key", command=copy_public_key).pack(side="left", padx=8)
-
-            # -----------------------------
-            # Step 2 — Paste API key (from Robinhood)
-            # -----------------------------
-            step2 = ttk.LabelFrame(container, text="Step 2 — Paste your Robinhood API Key here")
-            step2.grid(row=3, column=0, sticky="nsew", pady=(0, 10))
-            step2.columnconfigure(0, weight=1)
-
-            step2_help = (
-                "In Robinhood, after you add the Public Key, Robinhood will show an API Key.\n"
-                "Paste that API Key below. (It often starts with 'rh.'.)"
-            )
-            ttk.Label(step2, text=step2_help, justify="left").grid(row=0, column=0, sticky="w", padx=10, pady=(8, 0))
-
-            api_key_var = tk.StringVar(value=existing_api_key or "")
-            api_ent = ttk.Entry(step2, textvariable=api_key_var)
-            api_ent.grid(row=1, column=0, sticky="ew", padx=10, pady=(6, 10))
-
-            def _test_credentials() -> None:
-                api_key = (api_key_var.get() or "").strip()
-                priv_b64 = (private_b64_state.get("value") or "").strip()
-
-                if not requests:
-                    messagebox.showerror(
-                        "Missing dependency",
-                        "The 'requests' package is required for the Test button.\n\n"
-                        "Fix: pip install requests\n\n"
-                        "(You can still Save without testing.)"
-                    )
-                    return
-
-                if not priv_b64:
-                    messagebox.showerror("Missing private key", "Step 1: click 'Generate Keys' first.")
-                    return
-                if not api_key:
-                    messagebox.showerror("Missing API key", "Paste the API key from Robinhood into Step 2 first.")
-                    return
-
-                # Safe test: market-data endpoint (no trading)
-                base_url = "https://trading.robinhood.com"
-                path = "/api/v1/crypto/marketdata/best_bid_ask/?symbol=BTC-USD"
-                method = "GET"
-                body = ""
-                ts = int(time.time())
-                msg = f"{api_key}{ts}{path}{method}{body}".encode("utf-8")
-
-                try:
-                    raw = base64.b64decode(priv_b64)
-
-                    # Accept either:
-                    #   - 32 bytes: Ed25519 seed
-                    #   - 64 bytes: NaCl/tweetnacl secretKey (seed + public)
-                    if len(raw) == 64:
-                        seed = raw[:32]
-                    elif len(raw) == 32:
-                        seed = raw
-                    else:
-                        raise ValueError(f"Unexpected private key length: {len(raw)} bytes (expected 32 or 64)")
-
-                    pk = ed25519.Ed25519PrivateKey.from_private_bytes(seed)
-                    sig_b64 = base64.b64encode(pk.sign(msg)).decode("utf-8")
-                except Exception as e:
-                    messagebox.showerror("Bad private key", f"Couldn't use your private key (r_secret.txt).\n\nError:\n{e}")
-                    return
-
-
-                headers = {
-                    "x-api-key": api_key,
-                    "x-timestamp": str(ts),
-                    "x-signature": sig_b64,
-                    "Content-Type": "application/json",
-                }
-
-                try:
-                    resp = requests.get(f"{base_url}{path}", headers=headers, timeout=10)
-                    if resp.status_code >= 400:
-                        # Give layman-friendly hints for common failures
-                        hint = ""
-                        if resp.status_code in (401, 403):
-                            hint = (
-                                "\n\nCommon fixes:\n"
-                                "  • Make sure you pasted the API Key (not the public key).\n"
-                                "  • In Robinhood, ensure the key has permissions READ + TRADE.\n"
-                                "  • If you just created the key, wait 30–60 seconds and try again.\n"
-                            )
-                        messagebox.showerror("Test failed", f"Robinhood returned HTTP {resp.status_code}.\n\n{resp.text}{hint}")
-                        return
-
-                    data = resp.json()
-                    # Try to show something reassuring
-                    ask = None
-                    try:
-                        if data.get("results"):
-                            ask = data["results"][0].get("ask_inclusive_of_buy_spread")
-                    except Exception:
-                        pass
-
-                    messagebox.showinfo(
-                        "Test successful",
-                        "✅ Your API Key + Private Key worked!\n\n"
-                        "Robinhood responded successfully.\n"
-                        f"BTC-USD ask (example): {ask if ask is not None else 'received'}\n\n"
-                        "Next: click Save."
-                    )
-                except Exception as e:
-                    messagebox.showerror("Test failed", f"Couldn't reach Robinhood.\n\nError:\n{e}")
-
-            step2_btns = ttk.Frame(step2)
-            step2_btns.grid(row=2, column=0, sticky="w", padx=10, pady=(0, 10))
-            ttk.Button(step2_btns, text="Test Credentials (safe, no trading)", command=_test_credentials).pack(side="left")
-
-            # -----------------------------
-            # Step 3 — Save
-            # -----------------------------
-            step3 = ttk.LabelFrame(container, text="Step 3 — Save to files (required)")
-            step3.grid(row=4, column=0, sticky="nsew")
-            step3.columnconfigure(0, weight=1)
-
-            ack_var = tk.BooleanVar(value=False)
-            ack = ttk.Checkbutton(
-                step3,
-                text="I understand r_secret.txt is PRIVATE and I will not share it.",
-                variable=ack_var,
-            )
-            ack.grid(row=0, column=0, sticky="w", padx=10, pady=(10, 6))
-
-            save_btns = ttk.Frame(step3)
-            save_btns.grid(row=1, column=0, sticky="w", padx=10, pady=(0, 12))
-
-            def do_save():
-                api_key = (api_key_var.get() or "").strip()
-                priv_b64 = (private_b64_state.get("value") or "").strip()
-
-                if not priv_b64:
-                    messagebox.showerror("Missing private key", "Step 1: click 'Generate Keys' first.")
-                    return
-
-                # Normalize private key so pt_thinker.py can load it:
-                # - Accept 32 bytes (seed) OR 64 bytes (seed+pub) from older hub versions
-                # - Save ONLY base64(seed32) to r_secret.txt
-                try:
-                    raw = base64.b64decode(priv_b64)
-                    if len(raw) == 64:
-                        raw = raw[:32]
-                        priv_b64 = base64.b64encode(raw).decode("utf-8")
-                        private_b64_state["value"] = priv_b64  # keep UI state consistent
-                    elif len(raw) != 32:
-                        messagebox.showerror(
-                            "Bad private key",
-                            f"Your private key decodes to {len(raw)} bytes, but it must be 32 bytes.\n\n"
-                            "Click 'Generate Keys' again to create a fresh keypair."
-                        )
-                        return
-                except Exception as e:
-                    messagebox.showerror(
-                        "Bad private key",
-                        f"Couldn't decode the private key as base64.\n\nError:\n{e}"
-                    )
-                    return
-
-                if not api_key:
-                    messagebox.showerror("Missing API key", "Step 2: paste your API key from Robinhood first.")
-                    return
-                if not bool(ack_var.get()):
-                    messagebox.showwarning(
-                        "Please confirm",
-                        "For safety, please check the box confirming you understand r_secret.txt is private."
-                    )
-                    return
-
-
-                # Small sanity warning (don’t block, just help)
-                if len(api_key) < 10:
-                    if not messagebox.askyesno(
-                        "API key looks short",
-                        "That API key looks unusually short. Are you sure you pasted the API Key from Robinhood?"
-                    ):
-                        return
-
-                # Back up existing files (so user can undo mistakes)
-                try:
-                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    if os.path.isfile(key_path):
-                        shutil.copy2(key_path, f"{key_path}.bak_{ts}")
-                    if os.path.isfile(secret_path):
-                        shutil.copy2(secret_path, f"{secret_path}.bak_{ts}")
-                except Exception:
-                    pass
-
-                try:
-                    with open(key_path, "w", encoding="utf-8") as f:
-                        f.write(api_key)
-                    with open(secret_path, "w", encoding="utf-8") as f:
-                        f.write(priv_b64)
-                except Exception as e:
-                    messagebox.showerror("Save failed", f"Couldn't write the credential files.\n\nError:\n{e}")
-                    return
-
-                _refresh_api_status()
-                messagebox.showinfo(
-                    "Saved",
-                    "✅ Saved!\n\n"
-                    "The trader will automatically read these files next time it starts:\n"
-                    f"  API Key → {_mask_path(key_path)}\n"
-                    f"  Private Key → {_mask_path(secret_path)}\n\n"
-                    "Next steps:\n"
-                    "  1) Close this window\n"
-                    "  2) Start the trader (pt_trader.py)\n"
-                    "If something fails, come back here and click 'Test Credentials'."
-                )
-                wiz.destroy()
-
-            ttk.Button(save_btns, text="Save", command=do_save).pack(side="left")
-            ttk.Button(save_btns, text="Close", command=wiz.destroy).pack(side="left", padx=8)
-
-        ttk.Label(frm, text="Robinhood API:").grid(row=r, column=0, sticky="w", padx=(0, 10), pady=6)
-
-        api_row = ttk.Frame(frm)
-        api_row.grid(row=r, column=1, columnspan=2, sticky="ew", pady=6)
-        api_row.columnconfigure(0, weight=1)
-
-        ttk.Label(api_row, textvariable=api_status_var).grid(row=0, column=0, sticky="w")
-        ttk.Button(api_row, text="Setup Wizard", command=_open_robinhood_api_wizard).grid(row=0, column=1, sticky="e", padx=(10, 0))
-        ttk.Button(api_row, text="Open Folder", command=_open_api_folder).grid(row=0, column=2, sticky="e", padx=(8, 0))
-        ttk.Button(api_row, text="Clear", command=_clear_api_files).grid(row=0, column=3, sticky="e", padx=(8, 0))
-
-        r += 1
-
-        _refresh_api_status()
-
-
-        ttk.Separator(frm, orient="horizontal").grid(row=r, column=0, columnspan=3, sticky="ew", pady=10); r += 1
-
-
         add_row(r, "UI refresh seconds:", ui_refresh_var); r += 1
         add_row(r, "Chart refresh seconds:", chart_refresh_var); r += 1
         add_row(r, "Candles limit:", candles_limit_var); r += 1
@@ -5104,7 +4568,6 @@ class PowerTraderHub(tk.Tk):
                 # Track coins before changes so we can detect newly added coins
                 prev_coins = set([str(c).strip().upper() for c in (self.settings.get("coins") or []) if str(c).strip()])
 
-                self.settings["main_neural_dir"] = main_dir_var.get().strip()
                 self.settings["coins"] = [c.strip().upper() for c in coins_var.get().split(",") if c.strip()]
                 self.settings["hub_data_dir"] = hub_dir_var.get().strip()
                 self.settings["script_neural_runner2"] = neural_script_var.get().strip()
@@ -5126,26 +4589,26 @@ class PowerTraderHub(tk.Tk):
                     new_coins = [c.strip().upper() for c in (self.settings.get("coins") or []) if c.strip()]
                     added = [c for c in new_coins if c and c not in prev_coins]
 
-                    main_dir = self.settings.get("main_neural_dir") or self.project_dir
-                    trainer_name = os.path.basename(str(self.settings.get("script_neural_trainer", "neural_trainer.py")))
+                    training_data_dir = os.path.join(self.project_dir, "training_data")
+                    trainer_name = os.path.basename(str(self.settings.get("script_neural_trainer", "pt_trainer.py")))
 
                     # Best-effort resolve source trainer path:
-                    # Prefer trainer living in the main (BTC) folder; fallback to the configured trainer path.
-                    src_main_trainer = os.path.join(main_dir, trainer_name)
-                    src_cfg_trainer = str(self.settings.get("script_neural_trainer", trainer_name))
-                    src_trainer_path = src_main_trainer if os.path.isfile(src_main_trainer) else src_cfg_trainer
+                    # Prefer trainer living in the project root.
+                    src_trainer_path = os.path.join(self.project_dir, trainer_name)
+                    if not os.path.isfile(src_trainer_path):
+                        # Fallback: maybe it's in training_data/BTC
+                        src_trainer_path = os.path.join(training_data_dir, "BTC", trainer_name)
 
                     for coin in added:
-                        if coin == "BTC":
-                            continue  # BTC uses main folder; no per-coin folder needed
-
-                        coin_dir = os.path.join(main_dir, coin)
+                        coin_dir = os.path.join(training_data_dir, coin)
                         if not os.path.isdir(coin_dir):
                             os.makedirs(coin_dir, exist_ok=True)
+                            if os.path.isfile(src_trainer_path):
+                                shutil.copy2(src_trainer_path, os.path.join(coin_dir, trainer_name))
 
-                        dst_trainer_path = os.path.join(coin_dir, trainer_name)
-                        if (not os.path.isfile(dst_trainer_path)) and os.path.isfile(src_trainer_path):
-                            shutil.copy2(src_trainer_path, dst_trainer_path)
+                    # 1) update internal variables
+                    self.coins = [str(c).strip().upper() for c in (self.settings.get("coins") or []) if str(c).strip()]
+                    self.coin_folders = build_coin_folders(self.coins)
                 except Exception:
                     pass
 

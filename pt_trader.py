@@ -1,21 +1,15 @@
-import base64
 import datetime
 import json
 import uuid
 import time
 import math
-from typing import Any, Dict, Optional
-import requests
-from nacl.signing import SigningKey
+from typing import Any, Dict, Optional, Tuple
 import os
 import colorama
 from colorama import Fore, Style
 import traceback
-from cryptography.hazmat.primitives.asymmetric import ed25519
-from cryptography.hazmat.primitives import serialization
 from pybit.unified_trading import HTTP
 from abc import ABC, abstractmethod
-import datetime
 
 # -----------------------------
 # GUI HUB OUTPUTS
@@ -34,18 +28,14 @@ ACCOUNT_VALUE_HISTORY_PATH = os.path.join(HUB_DATA_DIR, "account_value_history.j
 colorama.init(autoreset=True)
 
 # -----------------------------
-# GUI SETTINGS (coins list + main_neural_dir)
-# -----------------------------
 _GUI_SETTINGS_PATH = os.environ.get("POWERTRADER_GUI_SETTINGS") or os.path.join(
 	os.path.dirname(os.path.abspath(__file__)),
 	"gui_settings.json"
 )
-
 _gui_settings_cache = {
 	"mtime": None,
 	"coins": ['BTC', 'ETH', 'XRP', 'BNB', 'DOGE'],  # fallback defaults
-	"main_neural_dir": None,
-    "exchange": "ROBINHOOD",
+    "exchange": "BYBIT",
     "bybit_demo": False
 }
 
@@ -53,7 +43,6 @@ def _load_gui_settings() -> dict:
 	"""
 	Reads gui_settings.json and returns a dict with:
 	- coins: uppercased list
-	- main_neural_dir: string (may be None)
 	Caches by mtime so it is cheap to call frequently.
 	"""
 	try:
@@ -74,68 +63,61 @@ def _load_gui_settings() -> dict:
 		if not coins:
 			coins = list(_gui_settings_cache["coins"])
 
-		main_neural_dir = data.get("main_neural_dir", None)
-		if isinstance(main_neural_dir, str):
-			main_neural_dir = main_neural_dir.strip() or None
-		else:
-			main_neural_dir = None
-
 		_gui_settings_cache["mtime"] = mtime
 		_gui_settings_cache["coins"] = coins
-		_gui_settings_cache["main_neural_dir"] = main_neural_dir
 
-		_gui_settings_cache["exchange"] = data.get("exchange", "ROBINHOOD")
+		_gui_settings_cache["exchange"] = data.get("exchange", "BYBIT")
 		_gui_settings_cache["bybit_demo"] = bool(data.get("bybit_demo", False))
 
 		return {
 			"mtime": mtime,
 			"coins": list(coins),
-			"main_neural_dir": main_neural_dir,
             "exchange": _gui_settings_cache["exchange"],
             "bybit_demo": _gui_settings_cache["bybit_demo"]
 		}
 	except Exception:
 		return dict(_gui_settings_cache)
 
-def _build_base_paths(main_dir_in: str, coins_in: list) -> dict:
+def _build_base_paths(coins_in: list) -> dict:
 	"""
 	Safety rule:
-	- BTC uses main_dir directly
-	- other coins use <main_dir>/<SYM> ONLY if that folder exists
-	  (no fallback to BTC folder — avoids corrupting BTC data)
+	- ALL coins use training_data/{SYM} subfolders
 	"""
-	out = {"BTC": main_dir_in}
+	out = {}
 	try:
+		# Get the project directory (where pt_trader.py lives)
+		project_dir = os.path.abspath(os.path.dirname(__file__)) if "__file__" in globals() else os.getcwd()
+		training_data_dir = os.path.join(project_dir, "training_data")
+
 		for sym in coins_in:
 			sym = str(sym).strip().upper()
 			if not sym:
 				continue
-			if sym == "BTC":
-				out["BTC"] = main_dir_in
-				continue
-			sub = os.path.join(main_dir_in, sym)
+			sub = os.path.join(training_data_dir, sym)
+			# Fallback to project root if subfolder doesn't exist yet, 
+			# but normally the Hub creates these.
 			if os.path.isdir(sub):
 				out[sym] = sub
+			else:
+				out[sym] = training_data_dir if sym == "BTC" else project_dir
 	except Exception:
 		pass
 	return out
 
 
 # Live globals (will be refreshed inside manage_trades())
+# Default behavior: all coins in training_data/ subfolders
 crypto_symbols = ['BTC', 'ETH', 'XRP', 'BNB', 'DOGE']
-
-# Default main_dir behavior if settings are missing
-main_dir = os.getcwd()
-base_paths = {"BTC": main_dir}
+base_paths = _build_base_paths(crypto_symbols)
 
 _last_settings_mtime = None
 
 def _refresh_paths_and_symbols():
 	"""
-	Hot-reload coins + main_neural_dir while trader is running.
-	Updates globals: crypto_symbols, main_dir, base_paths
+	Hot-reload coins while trader is running.
+	Updates globals: crypto_symbols, base_paths
 	"""
-	global crypto_symbols, main_dir, base_paths, _last_settings_mtime
+	global crypto_symbols, base_paths, _last_settings_mtime
 
 	s = _load_gui_settings()
 	mtime = s.get("mtime", None)
@@ -150,15 +132,9 @@ def _refresh_paths_and_symbols():
 	_last_settings_mtime = mtime
 
 	coins = s.get("coins") or list(crypto_symbols)
-	mndir = s.get("main_neural_dir") or main_dir
-
-	# Keep it safe if folder isn't real on this machine
-	if not os.path.isdir(mndir):
-		mndir = os.getcwd()
 
 	crypto_symbols = list(coins)
-	main_dir = mndir
-	base_paths = _build_base_paths(main_dir, crypto_symbols)
+	base_paths = _build_base_paths(crypto_symbols)
 
 
 #API key loading moved to Bot class
@@ -176,83 +152,6 @@ class Exchange(ABC):
     @abstractmethod
     def place_order(self, side: str, symbol: str, quantity: float, price: Optional[float] = None, order_type: str = "market", client_order_id: str = "") -> Any: ...
 
-class RobinhoodExchange(Exchange):
-    def __init__(self, api_key, private_key_base64):
-        self.api_key = api_key
-        private_key_seed = base64.b64decode(private_key_base64)
-        self.private_key = SigningKey(private_key_seed)
-        self.base_url = "https://trading.robinhood.com"
-    
-    def _get_current_timestamp(self) -> int:
-        return int(datetime.datetime.now(tz=datetime.timezone.utc).timestamp())
-
-    def get_authorization_header(self, method: str, path: str, body: str, timestamp: int) -> Dict[str, str]:
-        message_to_sign = f"{self.api_key}{timestamp}{path}{method}{body}"
-        signed = self.private_key.sign(message_to_sign.encode("utf-8"))
-        return {
-            "x-api-key": self.api_key,
-            "x-signature": base64.b64encode(signed.signature).decode("utf-8"),
-            "x-timestamp": str(timestamp),
-        }
-
-    def make_api_request(self, method: str, path: str, body: Optional[str] = "") -> Any:
-        timestamp = self._get_current_timestamp()
-        headers = self.get_authorization_header(method, path, body, timestamp)
-        url = self.base_url + path
-        try:
-            if method == "GET":
-                response = requests.get(url, headers=headers, timeout=10)
-            elif method == "POST":
-                cleaned_body = json.loads(body) if body else {}
-                response = requests.post(url, headers=headers, json=cleaned_body, timeout=10)
-            response.raise_for_status()
-            return response.json()
-        except Exception:
-            try:
-                return response.json()
-            except:
-                return None
-
-    def get_account(self) -> Any:
-        path = "/api/v1/crypto/trading/accounts/"
-        return self.make_api_request("GET", path)
-
-    def get_holdings(self) -> Any:
-        path = "/api/v1/crypto/trading/holdings/"
-        return self.make_api_request("GET", path)
-    
-    def get_orders(self, symbol: str) -> Any:
-        # RH returns standard structure expected by calclulate_cost_basis
-        path = f"/api/v1/crypto/trading/orders/?symbol={symbol}"
-        return self.make_api_request("GET", path)
-
-    def get_price(self, symbols: list) -> tuple:
-        buy_prices = {}
-        sell_prices = {}
-        valid_symbols = []
-        for symbol in symbols:
-            if symbol == "USDC-USD": continue
-            path = f"/api/v1/crypto/marketdata/best_bid_ask/?symbol={symbol}"
-            response = self.make_api_request("GET", path)
-            if response and "results" in response:
-                result = response["results"][0]
-                ask = float(result["ask_inclusive_of_buy_spread"])
-                bid = float(result["bid_inclusive_of_sell_spread"])
-                buy_prices[symbol] = ask
-                sell_prices[symbol] = bid
-                valid_symbols.append(symbol)
-        return buy_prices, sell_prices, valid_symbols
-
-    def place_order(self, side: str, symbol: str, quantity: float, price: Optional[float] = None, order_type: str = "market", client_order_id: str = "") -> Any:
-        body = {
-            "client_order_id": client_order_id or str(uuid.uuid4()),
-            "side": side,
-            "type": order_type,
-            "symbol": symbol,
-            "market_order_config": {"asset_quantity": f"{quantity:.8f}"}
-        }
-        path = "/api/v1/crypto/trading/orders/"
-        return self.make_api_request("POST", path, json.dumps(body))
 
 
 class BybitExchange(Exchange):
@@ -307,12 +206,39 @@ class BybitExchange(Exchange):
             return {"results": []}
 
     def get_orders(self, symbol: str) -> Any:
-        # Bybit: details...
-        # For simplicity, we might just return empty if history is hard to map, 
-        # BUT calculate_cost_basis relies on this.
-        # This is the hardest part.
-        pass # To be implemented fully or standardized.
-        return {"results": []} 
+        # RH: BTC-USD -> Bybit: BTCUSDT
+        sym_bb = symbol.replace("-USD", "USDT")
+        try:
+            # Fetch from Bybit V5 order history (Spot category)
+            resp = self.session.get_order_history(category="spot", symbol=sym_bb, limit=50)
+            if resp.get('retCode') != 0:
+                msg = str(resp.get('retMsg', 'Unknown')).encode('ascii', 'ignore').decode('ascii')
+                print(f"[Bybit] get_order_history failed: {msg}")
+                return {"results": []}
+            
+            results = []
+            orders_list = resp.get('result', {}).get('list', [])
+            for o in orders_list:
+                # Normalize to the structure expected by calculate_cost_basis/initialize_dca_levels
+                # RH expects "state": "filled", "side": "buy"/"sell", "created_at": iso_str, "executions": [...]
+                normalized = {
+                    "id": o.get('orderId'),
+                    "side": o.get('side', '').lower(),
+                    "state": "filled" if o.get('orderStatus') == "Filled" else o.get('orderStatus', '').lower(),
+                    "created_at": o.get('createdTime'), # Milliseconds timestamp as string
+                    "executions": [
+                        {
+                            "quantity": o.get('cumExecQty', '0'),
+                            "effective_price": o.get('avgPrice', '0')
+                        }
+                    ]
+                }
+                results.append(normalized)
+            return {"results": results}
+        except Exception as e:
+            msg = str(e).encode('ascii', 'ignore').decode('ascii')
+            print(f"[Bybit] get_orders failed: {msg}")
+            return {"results": []}
 
     def get_price(self, symbols: list) -> tuple:
         # Bybit Tickers
@@ -364,33 +290,27 @@ class PowerTraderBot:
         # keep a copy of the folder map (same idea as trader.py)
         self.path_map = dict(base_paths)
         
-        # Load Settings/Exchange
+        # Load Settings/Exchange (default to BYBIT)
         settings = _load_gui_settings()
-        self.exchange_name = settings.get("exchange", "ROBINHOOD")
+        self.exchange_name = settings.get("exchange", "BYBIT")
         
-        if self.exchange_name == "BYBIT":
-             try:
-                with open('b_key.txt', 'r', encoding='utf-8') as f:
-                    api_key = (f.read() or "").strip()
-                with open('b_secret.txt', 'r', encoding='utf-8') as f:
-                    api_secret = (f.read() or "").strip()
-                self.exchange = BybitExchange(api_key, api_secret, demo=settings.get("bybit_demo", False))
-                print(f"[PowerTrader] Initialized Bybit Exchange (demo={settings.get('bybit_demo')})")
-             except Exception as e:
-                print(f"[PowerTrader] Failed to load Bybit credentials (b_key.txt/b_secret.txt): {e}")
-                raise SystemExit(1)
-        else:
-            # Default to Robinhood
-            try:
-                with open('r_key.txt', 'r', encoding='utf-8') as f:
-                    api_key = (f.read() or "").strip()
-                with open('r_secret.txt', 'r', encoding='utf-8') as f:
-                    priv_key = (f.read() or "").strip()
-                self.exchange = RobinhoodExchange(api_key, priv_key)
-                print("[PowerTrader] Initialized Robinhood Exchange")
-            except Exception as e:
-                print("\n[PowerTrader] Robinhood credentials missing/invalid.")
-                raise SystemExit(1)
+        # PowerTrader now uses Bybit as the primary exchange
+        try:
+            with open('b_key.txt', 'r', encoding='utf-8') as f:
+                api_key = (f.read() or "").strip()
+            with open('b_secret.txt', 'r', encoding='utf-8') as f:
+                api_secret = (f.read() or "").strip()
+            
+            is_demo = settings.get("bybit_demo", False)
+            self.exchange = BybitExchange(api_key, api_secret, demo=is_demo)
+            print(f"[PowerTrader] Initialized Bybit Exchange (demo={is_demo})")
+            
+        except FileNotFoundError:
+            print("\n[PowerTrader] Bybit credentials (b_key.txt/b_secret.txt) not found.")
+            raise SystemExit(1)
+        except Exception as e:
+            print(f"[PowerTrader] Failed to initialize exchange: {e}")
+            raise SystemExit(1)
 
         self.dca_levels_triggered = {}  # Track DCA levels for each crypto
         self.dca_levels = [-2.5, -5.0, -10.0, -20.0, -30.0, -40.0, -50.0]  # Moved to instance variable
@@ -410,6 +330,9 @@ class PowerTraderBot:
 
         # Cache last known bid/ask per symbol so transient API misses don't zero out account value
         self._last_good_bid_ask = {}
+
+        # Cache last known position data per symbol to prevent UI flickering on transient API misses
+        self._last_good_positions = {}
 
         # Cache last *complete* account snapshot so transient holdings/price misses can't write a bogus low value
         self._last_good_account_snapshot = {
@@ -564,7 +487,7 @@ class PowerTraderBot:
         - DCA assist: levels 4-7 map to trader DCA stages 0-3 (trade starts at level 3 => stage 0)
         """
         sym = str(symbol).upper().strip()
-        folder = base_paths.get(sym, main_dir if sym == "BTC" else os.path.join(main_dir, sym))
+        folder = base_paths.get(sym)
         path = os.path.join(folder, "long_dca_signal.txt")
         try:
             with open(path, "r") as f:
@@ -585,7 +508,7 @@ class PowerTraderBot:
         - DCA assist: levels 4-7 map to trader DCA stages 0-3 (trade starts at level 3 => stage 0)
         """
         sym = str(symbol).upper().strip()
-        folder = base_paths.get(sym, main_dir if sym == "BTC" else os.path.join(main_dir, sym))
+        folder = base_paths.get(sym)
         path = os.path.join(folder, "short_dca_signal.txt")
         try:
             with open(path, "r") as f:
@@ -606,7 +529,7 @@ class PowerTraderBot:
           N7 = 7th blue line (bottom)
         """
         sym = str(symbol).upper().strip()
-        folder = base_paths.get(sym, main_dir if sym == "BTC" else os.path.join(main_dir, sym))
+        folder = base_paths.get(sym)
         path = os.path.join(folder, "low_bound_prices.html")
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -896,8 +819,24 @@ class PowerTraderBot:
                 if remaining_quantity <= 0:
                     break
 
+            if total_cost == 0.0 and current_quantities.get(asset_code, 0) > 0:
+                # Fallback: if quantity > 0 but no history found, use current price as basis
+                try:
+                    # Use self.get_price directly which handles exchange triplet
+                    res = self.get_price([f"{asset_code}-USD"])
+                    if res and len(res) >= 1:
+                        buy_px = res[0]
+                        fallback_price = buy_px.get(f"{asset_code}-USD", 0.0)
+                        if fallback_price > 0:
+                             print(f"  [Basis] No history for {asset_code}. Falling back to current price: ${fallback_price:.2f}")
+                             cost_basis[asset_code] = fallback_price
+                except Exception as e:
+                    print(f"  [Basis] Fallback failed for {asset_code}: {e}")
+                    pass
+
             if current_quantities.get(asset_code, 0) > 0:
-                cost_basis[asset_code] = total_cost / current_quantities[asset_code]
+                if asset_code not in cost_basis: # Only if fallback didn't already set it
+                    cost_basis[asset_code] = total_cost / current_quantities[asset_code]
             else:
                 cost_basis[asset_code] = 0.0
 
@@ -1032,6 +971,9 @@ class PowerTraderBot:
     def manage_trades(self):
         trades_made = False  # Flag to track if any trade was made in this iteration
 
+        # Reset price cache for this iteration
+        self._all_current_prices_cache = {}
+
         # Hot-reload coins list + paths from GUI settings while running
         try:
             _refresh_paths_and_symbols()
@@ -1146,7 +1088,13 @@ class PowerTraderBot:
             symbol = holding["asset_code"]
             full_symbol = f"{symbol}-USD"
 
-            if full_symbol not in valid_symbols or symbol == "USDC":
+            if symbol == "USDC":
+                continue
+
+            # If missing price this tick, try to recover from cache
+            if full_symbol not in valid_symbols:
+                if symbol in self._last_good_positions:
+                    positions[symbol] = self._last_good_positions[symbol]
                 continue
 
             quantity = float(holding["total_quantity"])
@@ -1259,9 +1207,11 @@ class PowerTraderBot:
 
                 if trail_line_disp > 0:
                     dist_to_trail_pct = ((current_sell_price - trail_line_disp) / trail_line_disp) * 100.0
-            file = open(symbol+'_current_price.txt', 'w+')
-            file.write(str(current_buy_price))
-            file.close()
+            # Consolidated price mapping for external use
+            all_current_prices = getattr(self, '_all_current_prices_cache', {})
+            all_current_prices[symbol] = current_buy_price
+            self._all_current_prices_cache = all_current_prices
+
             positions[symbol] = {
                 "quantity": quantity,
                 "avg_cost_basis": avg_cost_basis,
@@ -1280,6 +1230,8 @@ class PowerTraderBot:
                 "trail_peak": float(trail_peak_disp) if trail_peak_disp else 0.0,
                 "dist_to_trail_pct": float(dist_to_trail_pct) if dist_to_trail_pct else 0.0,
             }
+            # Update cache
+            self._last_good_positions[symbol] = positions[symbol]
 
 
             print(
@@ -1476,13 +1428,11 @@ class PowerTraderBot:
                 current_buy_price = current_buy_prices.get(full_symbol, 0.0)
                 current_sell_price = current_sell_prices.get(full_symbol, 0.0)
 
-                # keep the per-coin current price file behavior for consistency
-                try:
-                    file = open(sym + '_current_price.txt', 'w+')
-                    file.write(str(current_buy_price))
-                    file.close()
-                except Exception:
-                    pass
+                # keep the consolidated price mapping updated
+                all_current_prices = getattr(self, '_all_current_prices_cache', {})
+                all_current_prices[sym] = current_buy_price
+                self._all_current_prices_cache = all_current_prices
+
 
                 positions[sym] = {
                     "quantity": 0.0,
@@ -1602,6 +1552,20 @@ class PowerTraderBot:
                 {"ts": status["timestamp"], "total_account_value": total_account_value},
             )
             self._write_trader_status(status)
+
+            # --- WRITE CONSOLIDATED PRICES ---
+            try:
+                price_list = []
+                for s, p in getattr(self, '_all_current_prices_cache', {}).items():
+                    price_list.append({"symbol": s, "price": p})
+                
+                # Sort by symbol for stability
+                price_list.sort(key=lambda x: x["symbol"])
+                
+                with open("current_prices.json", "w", encoding="utf-8") as f:
+                    json.dump(price_list, f, indent=2)
+            except Exception:
+                pass
         except Exception:
             pass
 

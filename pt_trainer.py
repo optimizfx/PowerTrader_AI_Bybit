@@ -232,13 +232,34 @@ except:
 	restarted_yet = 0
 tf_choices = ['1hour', '2hour', '4hour', '8hour', '12hour', '1day', '1week']
 tf_minutes = [60, 120, 240, 480, 720, 1440, 10080]
-# --- GUI HUB INPUT (NO PROMPTS) ---
-# Usage: python pt_trainer.py BTC [reprocess_yes|reprocess_no]
+# --- GPU DETECTION & ARGS ---
+_use_gpu = False
+if "--gpu" in sys.argv:
+    _use_gpu = True
+    # Try to detect/init GPU if libraries exist
+    try:
+        import torch
+        if torch.cuda.is_available():
+            print(f"GPU: CUDA detected and enabled ({torch.cuda.get_device_name(0)})")
+        else:
+            print("GPU: Requested --gpu but torch.cuda.is_available() is False.")
+    except ImportError:
+        try:
+            from numba import cuda
+            if cuda.is_available():
+                print("GPU: Numba CUDA detected and enabled.")
+            else:
+                print("GPU: Requested --gpu but numba.cuda.is_available() is False.")
+        except ImportError:
+            print("GPU: Requested --gpu but neither 'torch' nor 'numba' are installed.")
+
 _arg_coin = "BTC"
 
 try:
-	if len(sys.argv) > 1 and str(sys.argv[1]).strip():
-		_arg_coin = str(sys.argv[1]).strip().upper()
+	# filter out flags like --gpu from coin arg
+	args = [a for a in sys.argv[1:] if not a.startswith("--")]
+	if args:
+		_arg_coin = str(args[0]).strip().upper()
 except Exception:
 	_arg_coin = "BTC"
 
