@@ -1,4 +1,5 @@
 # PowerTrader_AI
+
 Fully automated crypto trading powered by a custom price prediction AI and a structured/tiered DCA system.
 
 “It’s an instance-based (kNN/kernel-style) predictor with online per-instance reliability weighting, used as a multi-timeframe trading signal.” - ChatGPT on the type of AI used in this trading bot.
@@ -7,7 +8,7 @@ So what exactly does that mean?
 
 When people think AI, they usually think about LLM style AIs and neural networks. What many people don't realize is there are many types of Artificial Intelligence and Machine Learning - and the one in my trading system falls under the "Other" category.
 
-When training for a coin, it goes through the entire history for that coin on multiple timeframes and saves each pattern it sees, along with what happens on the next candle AFTER the pattern. It uses these saved patterns to generate a predicted candle by taking a weighted average of the closest matches in memory to the current pattern in time. This weighted average output is done once for each timeframe, from 1 hour up to 1 week. Each timeframe gets its own predicted candle. The low and high prices from these candles are what are shown as the blue and orange horizontal lines on the price charts. 
+When training for a coin, it goes through the entire history for that coin on multiple timeframes and saves each pattern it sees, along with what happens on the next candle AFTER the pattern. It uses these saved patterns to generate a predicted candle by taking a weighted average of the closest matches in memory to the current pattern in time. This weighted average output is done once for each timeframe, from 1 hour up to 1 week. Each timeframe gets its own predicted candle. The low and high prices from these candles are what are shown as the blue and orange horizontal lines on the price charts.
 
 After a candle closes, it checks what happened against what it predicted, and adjusts the weight for each "memory pattern" that was used to generate the weighted average, depending on how accurate each pattern was compared to what actually happened.
 
@@ -20,7 +21,6 @@ For determining when to start trades, the AI's Thinker script sends a signal to 
 For determining when to DCA, it uses either the current price level from the AI that is tied to the current amount of DCA buys that have been done on the trade (for example, right after a trade starts when 3 blue lines get crossed, its first DCA wont happen until the price crosses the 4th line, so on so forth), or it uses the hardcoded drawdown % for its current level, whichever it hits first. It allows a max of 2 DCAs within a rolling 24hr window to keep from dumping all of your money in too quickly on coins that are having an extended downtrend!
 
 For determining when to sell, the bot uses a trailing profit margin to maximize the potential gains. The margin line is set at either 5% gain if no DCA has happened on the trade, or 2.5% gain if any DCA has happened. The trailing margin gap is 0.5% (this is the amount the price has to go over the profit margin to begin raising the profit margin up to TRAIL after the price and maximize how much profit is gained once the price drops below the profit margin again and the bot sells the trade.
-
 
 # Setup & First-Time Use (Windows)
 
@@ -53,26 +53,39 @@ Keep your API keys private. We are not giving financial advice. We are not respo
 
 ---
 
-## Step 3 — Install PowerTrader AI (one command)
+---
 
-1. Open **Command Prompt** (Windows key → type **cmd** → Enter).
-2. Go into your PowerTrader AI folder. Example:
+## Step 3 — Set Up Virtual Environment (Recommended)
 
+Using a virtual environment keeps PowerTrader AI's dependencies separate from other Python projects on your computer.
+
+1. Open **Command Prompt** and go to your folder:
    `cd C:\PowerTraderAI`
+2. Create the environment:
+   `python -m venv venv`
+3. Activate it:
+   `venv\Scripts\activate`
 
-3. If using Python 3.12 or higher, run this command:
-
-   `python -m pip install setuptools`
-
-4. Install everything PowerTrader AI needs:
-
-   `python -m pip install -r requirements.txt`
+Once activated, your command prompt will show `(venv)` at the beginning of the line. **You must activate the venv every time you open a new command prompt to run the bot.**
 
 ---
 
-## Step 4 — Start PowerTrader AI
+## Step 4 — Install PowerTrader AI
 
-From the same Command Prompt window (inside your PowerTrader folder), run:
+With your virtual environment **activated**, run these commands:
+
+1. If using Python 3.12 or higher:
+   `python -m pip install setuptools`
+
+2. Install everything PowerTrader AI needs:
+   - **For Standard (CPU) users:** `python -m pip install -r requirements.txt`
+   - **For NVIDIA GPU users:** `python -m pip install -r requirements-gpu.txt`
+
+---
+
+## Step 5 — Start PowerTrader AI
+
+From the same Command Prompt window (with `venv` active), run:
 
 `python pt_hub.py`
 
@@ -81,7 +94,7 @@ This is the only thing you need to run day-to-day.
 
 ---
 
-## Step 5 — Set your Bybit keys (inside the Hub)
+## Step 6 — Set your Bybit keys (inside the Hub)
 
 ### Open Settings
 
@@ -106,7 +119,7 @@ PowerTrader AI uses a simple folder style:
 
 ---
 
-## Step 6 — Train (inside the Hub)
+## Step 7 — Train (inside the Hub)
 
 Training builds the system’s coin “memory” so it can generate signals.
 
@@ -115,7 +128,7 @@ Training builds the system’s coin “memory” so it can generate signals.
 
 ---
 
-## Step 7 — Start the system (inside the Hub)
+## Step 8 — Start the system (inside the Hub)
 
 When training is done, click:
 

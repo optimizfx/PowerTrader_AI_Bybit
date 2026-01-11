@@ -1,10 +1,20 @@
 
 /__pycache__
 /hub_data
-/training_data
+/venv
 
 # API KEYS
 b_key.txt
 b_secret.txt
 
+# generated json files to ignore
 gui_settings.json
+trainer_status.json
+current_prices.json
+
+# generated txt files to ignore
+memories_1hour.txt
+memory_weights_1hour.txt
+memory_weights_high_1hour.txt
+memory_weights_low_1hour.txt
+neural_perfect_threshold_1hour.txt

@@ -149,6 +149,38 @@ def load_memory(tf_choice):
 	_memory_cache[tf_choice] = data
 	return data
 
+# --- VECTORIZED GPU HELPER ---
+def get_tensor_data(tf_choice, device):
+	"""Convert cached text patterns into torch tensors for high-speed GPU/CPU math."""
+	data = load_memory(tf_choice)
+	if "tensor_patterns" in data and data["tensor_patterns"].device == device:
+		return data["tensor_patterns"], data["tensor_highs"], data["tensor_lows"]
+
+	# Parse text patterns into a matrix
+	patterns = []
+	highs = []
+	lows = []
+	for entry in data["memory_list"]:
+		if not entry or "{}" not in entry:
+			continue
+		parts = entry.split("{}")
+		p_str = parts[0].strip().split(" ")
+		patterns.append([float(x) for x in p_str if x])
+		highs.append(float(parts[1]) / 100.0)
+		lows.append(float(parts[2]) / 100.0)
+
+	import torch
+	data["tensor_patterns"] = torch.tensor(patterns, dtype=torch.float32, device=device)
+	data["tensor_highs"] = torch.tensor(highs, dtype=torch.float32, device=device)
+	data["tensor_lows"] = torch.tensor(lows, dtype=torch.float32, device=device)
+	
+	# Weights
+	data["tensor_weights"] = torch.tensor([float(x) for x in data["weight_list"] if x], dtype=torch.float32, device=device)
+	data["tensor_high_weights"] = torch.tensor([float(x) for x in data["high_weight_list"] if x], dtype=torch.float32, device=device)
+	data["tensor_low_weights"] = torch.tensor([float(x) for x in data["low_weight_list"] if x], dtype=torch.float32, device=device)
+	
+	return data["tensor_patterns"], data["tensor_highs"], data["tensor_lows"]
+
 def flush_memory(tf_choice, force=False):
 	"""Write memories/weights back to disk only when they changed (batch IO)."""
 	data = _memory_cache.get(tf_choice)
@@ -890,70 +922,158 @@ while True:
 							low_unweighted = []
 							high_moves = []
 							low_moves = []
-							while True:
-								memory_pattern = memory_list[mem_ind].split('{}')[0].replace("'","").replace(',','').replace('"','').replace(']','').replace('[','').split(' ')
-								avgs = []
-								checks = []
-								check_dex = 0
-								while True:
-									current_candle = float(current_pattern[check_dex])
-									memory_candle = float(memory_pattern[check_dex])
-									if current_candle + memory_candle == 0.0:
-										difference = 0.0
+							# --- START GPU/CPU ACCELERATED LOOP ---
+							_accel_used = False
+							if _use_gpu:
+								try:
+									import torch
+									device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+									
+									# Get tensors
+									t_patterns, t_highs, t_lows = get_tensor_data(tf_choice, device)
+									t_current = torch.tensor(current_pattern, dtype=torch.float32, device=device)
+									
+									# Weight tensors
+									mem_data = load_memory(tf_choice)
+									t_w = mem_data["tensor_weights"]
+									t_hw = mem_data["tensor_high_weights"]
+									t_lw = mem_data["tensor_low_weights"]
+
+									# Vectorized Symmetric Mean Absolute Percentage Error (approx)
+									# difference = abs((abs(current-memory)/((current+memory)/2))*100)
+									# Shape: [N_memories, Pattern_Len]
+									denom = (t_patterns + t_current) / 2.0
+									# Avoid div by zero
+									denom = torch.where(denom == 0, torch.ones_like(denom), denom)
+									diffs = torch.abs(torch.abs(t_patterns - t_current) / denom) * 100.0
+									
+									# Mean across candle dimension [N_memories]
+									t_diffs_list = torch.mean(diffs, dim=1)
+									
+									# Find perfect matches
+									mask = t_diffs_list <= perfect_threshold
+									perfect_indices = torch.where(mask)[0]
+									
+									# OPTIMIZED: Don't copy everything back to CPU unless needed!
+									# diffs_list = t_diffs_list.cpu().tolist()
+									diffs_list = [] # Placeholder
+									
+									if perfect_indices.numel() > 0:
+										any_perfect = 'yes'
+										# Extract moves and weights for perfect matches
+										p_patterns = t_patterns[perfect_indices]
+										p_highs = t_highs[perfect_indices]
+										p_lows = t_lows[perfect_indices]
+										p_w = t_w[perfect_indices]
+										p_hw = t_hw[perfect_indices]
+										p_lw = t_lw[perfect_indices]
+										
+										# Moves: Pattern[last] * Weight
+										p_moves_unweighted = p_patterns[:, -1]
+										moves = (p_moves_unweighted * p_w).cpu().tolist()
+										high_moves = (p_highs * p_hw).cpu().tolist()
+										low_moves = (p_lows * p_lw).cpu().tolist()
+										
+										unweighted = p_moves_unweighted.cpu().tolist()
+										high_unweighted = p_highs.cpu().tolist()
+										low_unweighted = p_lows.cpu().tolist()
+										
+										move_weights = p_w.cpu().tolist()
+										high_move_weights = p_hw.cpu().tolist()
+										low_move_weights = p_lw.cpu().tolist()
+										
+										perfect_dexs = perfect_indices.cpu().tolist()
+										perfect_diffs = t_diffs_list[perfect_indices].cpu().tolist()
+										
+										# Means for final moves
+										final_moves = torch.mean(p_moves_unweighted * p_w).item()
+										high_final_moves = torch.mean(p_highs * p_hw).item()
+										low_final_moves = torch.mean(p_lows * p_lw).item()
+										
+										# Best memory index for status tracking
+										min_diff_val, min_diff_idx = torch.min(t_diffs_list[perfect_indices], dim=0)
+										which_memory_index = perfect_indices[min_diff_idx].item()
+										perfect.append('yes')
 									else:
-										try:
-											difference = abs((abs(current_candle-memory_candle)/((current_candle+memory_candle)/2))*100)
-										except:
-											difference = 0.0
-									checks.append(difference)
-									check_dex += 1
-									if check_dex >= len(current_pattern):
-										break
-									else:
-										continue
-								diff_avg = sum(checks)/len(checks)
-								if diff_avg <= perfect_threshold:
-									any_perfect = 'yes'
-									high_diff = float(memory_list[mem_ind].split('{}')[1].replace("'","").replace(',','').replace('"','').replace(']','').replace('[','').replace(' ',''))/100
-									low_diff = float(memory_list[mem_ind].split('{}')[2].replace("'","").replace(',','').replace('"','').replace(']','').replace('[','').replace(' ',''))/100
-									unweighted.append(float(memory_pattern[len(memory_pattern)-1]))
-									move_weights.append(float(weight_list[mem_ind]))
-									high_move_weights.append(float(high_weight_list[mem_ind]))
-									low_move_weights.append(float(low_weight_list[mem_ind]))
-									high_unweighted.append(high_diff)
-									low_unweighted.append(low_diff)
-									moves.append(float(memory_pattern[len(memory_pattern)-1])*float(weight_list[mem_ind]))
-									high_moves.append(high_diff*float(high_weight_list[mem_ind]))
-									low_moves.append(low_diff*float(low_weight_list[mem_ind]))
-									perfect_dexs.append(mem_ind)
-									perfect_diffs.append(diff_avg)
-								else:
-									pass
-								diffs_list.append(diff_avg)
-								mem_ind += 1
-								if mem_ind >= len(memory_list):
-									if any_perfect == 'no':
-										memory_diff = min(diffs_list)
-										which_memory_index = diffs_list.index(memory_diff)
+										any_perfect = 'no'
+										memory_diff = torch.min(t_diffs_list).item()
+										which_memory_index = torch.argmin(t_diffs_list).item()
 										perfect.append('no')
 										final_moves = 0.0
 										high_final_moves = 0.0
 										low_final_moves = 0.0
 										new_memory = 'yes'
+									
+									_accel_used = True
+								except Exception as e:
+									vprint(f"GPU Accel failed, falling back: {e}")
+									_accel_used = False
+
+							if not _accel_used:
+								while True:
+									memory_pattern = memory_list[mem_ind].split('{}')[0].replace("'","").replace(',','').replace('"','').replace(']','').replace('[','').split(' ')
+									avgs = []
+									checks = []
+									check_dex = 0
+									while True:
+										current_candle = float(current_pattern[check_dex])
+										memory_candle = float(memory_pattern[check_dex])
+										if current_candle + memory_candle == 0.0:
+											difference = 0.0
+										else:
+											try:
+												difference = abs((abs(current_candle-memory_candle)/((current_candle+memory_candle)/2))*100)
+											except:
+												difference = 0.0
+										checks.append(difference)
+										check_dex += 1
+										if check_dex >= len(current_pattern):
+											break
+										else:
+											continue
+									diff_avg = sum(checks)/len(checks)
+									if diff_avg <= perfect_threshold:
+										any_perfect = 'yes'
+										high_diff = float(memory_list[mem_ind].split('{}')[1].replace("'","").replace(',','').replace('"','').replace(']','').replace('[','').replace(' ',''))/100
+										low_diff = float(memory_list[mem_ind].split('{}')[2].replace("'","").replace(',','').replace('"','').replace(']','').replace('[','').replace(' ',''))/100
+										unweighted.append(float(memory_pattern[len(memory_pattern)-1]))
+										move_weights.append(float(weight_list[mem_ind]))
+										high_move_weights.append(float(high_weight_list[mem_ind]))
+										low_move_weights.append(float(low_weight_list[mem_ind]))
+										high_unweighted.append(high_diff)
+										low_unweighted.append(low_diff)
+										moves.append(float(memory_pattern[len(memory_pattern)-1])*float(weight_list[mem_ind]))
+										high_moves.append(high_diff*float(high_weight_list[mem_ind]))
+										low_moves.append(low_diff*float(low_weight_list[mem_ind]))
+										perfect_dexs.append(mem_ind)
+										perfect_diffs.append(diff_avg)
 									else:
-										try:
-											final_moves = sum(moves)/len(moves)
-											high_final_moves = sum(high_moves)/len(high_moves)
-											low_final_moves = sum(low_moves)/len(low_moves)
-										except:
+										pass
+									diffs_list.append(diff_avg)
+									mem_ind += 1
+									if mem_ind >= len(memory_list):
+										if any_perfect == 'no':
+											memory_diff = min(diffs_list)
+											which_memory_index = diffs_list.index(memory_diff)
+											perfect.append('no')
 											final_moves = 0.0
 											high_final_moves = 0.0
 											low_final_moves = 0.0
-										which_memory_index = perfect_dexs[perfect_diffs.index(min(perfect_diffs))]
-										perfect.append('yes')
-									break
-								else:
-									continue
+											new_memory = 'yes'
+										else:
+											try:
+												final_moves = sum(moves)/len(moves)
+												high_final_moves = sum(high_moves)/len(high_moves)
+												low_final_moves = sum(low_moves)/len(low_moves)
+											except:
+												final_moves = 0.0
+												high_final_moves = 0.0
+												low_final_moves = 0.0
+											which_memory_index = perfect_dexs[perfect_diffs.index(min(perfect_diffs))]
+											perfect.append('yes')
+										break
+									else:
+										continue
 						except:
 							PrintException()
 							memory_list = []
@@ -1221,11 +1341,14 @@ while True:
 							except:
 								pass
 							try:
-								print('current candle: '+str(len(price_list2)))
-							except:
-								pass
-							try:
-								print('Total Candles: '+str(int(len(price_list))))
+								cur_c = len(price_list2)
+								tot_c = int(len(price_list))
+								if tot_c > 0:
+									prog_perc = (cur_c / tot_c) * 100.0
+									print(f"[{_arg_coin}] Progress: {prog_perc:.2f}% (Candle: {cur_c}/{tot_c})")
+								else:
+									print('current candle: '+str(cur_c))
+									print('Total Candles: '+str(tot_c))
 							except:
 								pass
 						except:
@@ -1496,80 +1619,13 @@ while True:
 													difference = 100.0
 												try:
 													direction = 'down'
-													try:
-														indy = 0
-														while True:
-															new_memory = 'no'
-															var3 = (moves[indy]*100)
-															high_var3 = (high_moves[indy]*100)
-															low_var3 = (low_moves[indy]*100)
-															if high_perc_diff_now_actual > high_var3+(high_var3*0.1):
-																high_new_weight = high_move_weights[indy] + 0.25
-																if high_new_weight > 2.0:
-																	high_new_weight = 2.0
-																else:
-																	pass
-															elif high_perc_diff_now_actual < high_var3-(high_var3*0.1):
-																high_new_weight = high_move_weights[indy] - 0.25
-																if high_new_weight < 0.0:
-																	high_new_weight = 0.0
-																else:
-																	pass
-															else:
-																high_new_weight = high_move_weights[indy]
-															if low_perc_diff_now_actual < low_var3-(low_var3*0.1):
-																low_new_weight = low_move_weights[indy] + 0.25
-																if low_new_weight > 2.0:
-																	low_new_weight = 2.0
-																else:
-																	pass
-															elif low_perc_diff_now_actual > low_var3+(low_var3*0.1):
-																low_new_weight = low_move_weights[indy] - 0.25
-																if low_new_weight < 0.0:
-																	low_new_weight = 0.0
-																else:
-																	pass
-															else:
-																low_new_weight = low_move_weights[indy]
-															if perc_diff_now_actual > var3+(var3*0.1):
-																new_weight = move_weights[indy] + 0.25
-																if new_weight > 2.0:
-																	new_weight = 2.0
-																else:
-																	pass
-															elif perc_diff_now_actual < var3-(var3*0.1):
-																new_weight = move_weights[indy] - 0.25
-																if new_weight < (0.0-2.0):
-																	new_weight = (0.0-2.0)
-																else:
-																	pass
-															else:
-																new_weight = move_weights[indy]
-															del weight_list[perfect_dexs[indy]]
-															weight_list.insert(perfect_dexs[indy],new_weight)
-															del high_weight_list[perfect_dexs[indy]]
-															high_weight_list.insert(perfect_dexs[indy],high_new_weight)
-															del low_weight_list[perfect_dexs[indy]]
-															low_weight_list.insert(perfect_dexs[indy],low_new_weight)
-
-															# mark dirty (we will flush in batches)
-															_mem = load_memory(tf_choice)
-															_mem["dirty"] = True
-
-															# occasional batch flush
-															if loop_i % 200 == 0:
-																flush_memory(tf_choice)
-
-															indy += 1
-															if indy >= len(unweighted):
-																break
-															else:
-																pass
-													except:
-														PrintException()
+													direction = 'down'
+													
+													# REFACTORED: Check for missing moves explicitly instead of Try/Except crash
+													# If moves is empty, it means no valid match was found previously.
+													if not moves:
+														# No matches -> Treat as new memory immediately
 														all_current_patterns[highlowind].append(this_diff)
-
-														# build the same memory entry format, but store in RAM
 														mem_entry = str(all_current_patterns[highlowind]).replace("'","").replace(',','').replace('"','').replace(']','').replace('[','')+'{}'+str(high_this_diff)+'{}'+str(low_this_diff)
 
 														_mem = load_memory(tf_choice)
@@ -1579,10 +1635,92 @@ while True:
 														_mem["low_weight_list"].append('1.0')
 														_mem["dirty"] = True
 
-														# occasional batch flush
 														if loop_i % 200 == 0:
 															flush_memory(tf_choice)
+													else:
+														try:
+															indy = 0
+															while True:
+																new_memory = 'no'
+																if indy >= len(moves):
+																	break
+																
+																var3 = (moves[indy]*100)
+																high_var3 = (high_moves[indy]*100)
+																low_var3 = (low_moves[indy]*100)
+																if high_perc_diff_now_actual > high_var3+(high_var3*0.1):
+																	high_new_weight = high_move_weights[indy] + 0.25
+																	if high_new_weight > 2.0:
+																		high_new_weight = 2.0
+																	else:
+																		pass
+																elif high_perc_diff_now_actual < high_var3-(high_var3*0.1):
+																	high_new_weight = high_move_weights[indy] - 0.25
+																	if high_new_weight < 0.0:
+																		high_new_weight = 0.0
+																	else:
+																		pass
+																else:
+																	high_new_weight = high_move_weights[indy]
+																if low_perc_diff_now_actual < low_var3-(low_var3*0.1):
+																	low_new_weight = low_move_weights[indy] + 0.25
+																	if low_new_weight > 2.0:
+																		low_new_weight = 2.0
+																	else:
+																		pass
+																elif low_perc_diff_now_actual > low_var3+(low_var3*0.1):
+																	low_new_weight = low_move_weights[indy] - 0.25
+																	if low_new_weight < 0.0:
+																		low_new_weight = 0.0
+																	else:
+																		pass
+																else:
+																	low_new_weight = low_move_weights[indy]
+																if perc_diff_now_actual > var3+(var3*0.1):
+																	new_weight = move_weights[indy] + 0.25
+																	if new_weight > 2.0:
+																		new_weight = 2.0
+																	else:
+																		pass
+																elif perc_diff_now_actual < var3-(var3*0.1):
+																	new_weight = move_weights[indy] - 0.25
+																	if new_weight < (0.0-2.0):
+																		new_weight = (0.0-2.0)
+																	else:
+																		pass
+																else:
+																	new_weight = move_weights[indy]
+																del weight_list[perfect_dexs[indy]]
+																weight_list.insert(perfect_dexs[indy],new_weight)
+																del high_weight_list[perfect_dexs[indy]]
+																high_weight_list.insert(perfect_dexs[indy],high_new_weight)
+																del low_weight_list[perfect_dexs[indy]]
+																low_weight_list.insert(perfect_dexs[indy],low_new_weight)
 
+																# mark dirty (we will flush in batches)
+																_mem = load_memory(tf_choice)
+																_mem["dirty"] = True
+
+																# occasional batch flush
+																if loop_i % 200 == 0:
+																	flush_memory(tf_choice)
+
+																indy += 1
+																if indy >= len(unweighted):
+																	break
+																else:
+																	pass
+														except:
+															PrintException()
+															# Fallback to creating new memory if something else breaks
+															all_current_patterns[highlowind].append(this_diff)
+															mem_entry = str(all_current_patterns[highlowind]).replace("'","").replace(',','').replace('"','').replace(']','').replace('[','')+'{}'+str(high_this_diff)+'{}'+str(low_this_diff)
+															_mem = load_memory(tf_choice)
+															_mem["memory_list"].append(mem_entry)
+															_mem["weight_list"].append('1.0')
+															_mem["high_weight_list"].append('1.0')
+															_mem["low_weight_list"].append('1.0')
+															_mem["dirty"] = True
 												except:
 													PrintException()
 													pass										

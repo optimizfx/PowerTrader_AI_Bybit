@@ -6,3 +6,7 @@ cryptography
 PyNaCl
 kucoin-python
 pybit
+torch
+
+# For NVIDIA GPU Acceleration, run this AFTER installing requirements:
+# pip install torch --index-url https://download.pytorch.org/whl/cu121 --force-reinstall
