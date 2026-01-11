@@ -255,22 +255,20 @@ COIN_SYMBOLS = _load_gui_coins()
 CURRENT_COINS = list(COIN_SYMBOLS)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TRAINING_DATA_DIR = os.path.join(BASE_DIR, "training_data")
 
 def coin_folder(sym: str) -> str:
-	sym = sym.upper()
+	"""Returns the folder path for a given coin symbol using FIXED training_data structure:
+	  - BTC: training_data/
+	  - Others: training_data/{COIN}/
 	
-	# Load latest settings to see if user effectively changed the 'root'
-	# Note: This means we check settings on every call, 
-	# but _load_gui_settings has mtime caching so it's fast.
-	s = _load_gui_settings()
-	root = s.get("main_neural_dir")
-	if not root or not os.path.isdir(root):
-		root = BASE_DIR
-
-	# Convention:
-	# BTC -> root
-	# Others -> root/DOGE
-	return root if sym == 'BTC' else os.path.join(root, sym)
+	Matches pt_hub.py:build_coin_folders() logic.
+	"""
+	sym = sym.upper().strip()
+	if sym == "BTC":
+		return TRAINING_DATA_DIR
+	else:
+		return os.path.join(TRAINING_DATA_DIR, sym)
 
 
 # --- training freshness gate (mirrors pt_hub.py) ---

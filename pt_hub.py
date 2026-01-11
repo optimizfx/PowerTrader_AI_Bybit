@@ -271,7 +271,7 @@ class NeuralSignalTile(ttk.Frame):
 # -----------------------------
 
 DEFAULT_SETTINGS = {
-    "main_neural_dir": r"C:\PowerTrader_AI",
+    "main_neural_dir": "training_data",  # Fixed folder (backward compatibility - not actually used)
     "coins": ["BTC", "ETH", "XRP", "BNB", "DOGE"],
     "exchange": "ROBINHOOD",
     "bybit_demo": False,
@@ -414,34 +414,42 @@ def _now_str() -> str:
 
 def build_coin_folders(main_dir: str, coins: List[str]) -> Dict[str, str]:
     """
-    Mirrors your convention:
-      BTC uses main_dir directly
-      other coins typically have subfolders inside main_dir (auto-detected)
-
+    Uses a FIXED training_data folder structure:
+      - BTC uses training_data/ directly
+      - Other coins use training_data/{COIN}/ subfolders
+    
+    This eliminates path confusion and ensures all scripts read/write to the same location.
+    
     Returns { "BTC": "...", "ETH": "...", ... }
     """
     out: Dict[str, str] = {}
-    main_dir = main_dir or os.getcwd()
-
-    # BTC folder
-    out["BTC"] = main_dir
-
-    # Auto-detect subfolders
-    if os.path.isdir(main_dir):
-        for name in os.listdir(main_dir):
-            p = os.path.join(main_dir, name)
-            if not os.path.isdir(p):
-                continue
-            sym = name.upper().strip()
-            if sym in coins and sym != "BTC":
-                out[sym] = p
-
-    # Fallbacks for missing ones
+    
+    # Get the project directory (where pt_hub.py lives)
+    project_dir = os.path.abspath(os.path.dirname(__file__)) if "__file__" in globals() else os.getcwd()
+    training_data_dir = os.path.join(project_dir, "training_data")
+    
+    # Ensure training_data directory exists
+    try:
+        os.makedirs(training_data_dir, exist_ok=True)
+    except Exception:
+        pass
+    
+    # BTC uses training_data root
+    out["BTC"] = training_data_dir
+    
+    # Other coins get subfolders
     for c in coins:
         c = c.upper().strip()
-        if c not in out:
-            out[c] = os.path.join(main_dir, c)  # best-effort fallback
-
+        if c == "BTC":
+            continue
+        coin_folder = os.path.join(training_data_dir, c)
+        out[c] = coin_folder
+        # Ensure subfolder exists
+        try:
+            os.makedirs(coin_folder, exist_ok=True)
+        except Exception:
+            pass
+    
     return out
 
 
@@ -1823,16 +1831,23 @@ class PowerTraderHub(tk.Tk):
         """
         try:
             coins = [str(c).strip().upper() for c in (self.settings.get("coins") or []) if str(c).strip()]
-            main_dir = (self.settings.get("main_neural_dir") or self.project_dir or os.getcwd()).strip()
+            main_dir = (self.settings.get("main_neural_dir") or "").strip()
+            
+            # Fallback if the configured main_dir is missing
+            if not main_dir or not os.path.isdir(main_dir):
+                main_dir = self.project_dir
 
-            trainer_name = os.path.basename(str(self.settings.get("script_neural_trainer", "neural_trainer.py")))
+            trainer_name = os.path.basename(str(self.settings.get("script_neural_trainer", "pt_trainer.py")))
 
-            # Source trainer: MAIN folder (BTC folder)
-            src_main_trainer = os.path.join(main_dir, trainer_name)
+            # Source trainer: Try BTC folder first, then project root
+            src_options = [
+                os.path.join(main_dir, trainer_name),
+                os.path.join(self.project_dir, trainer_name)
+            ]
+            src_trainer_path = next((p for p in src_options if os.path.isfile(p)), None)
 
-            # Best-effort fallback if the main folder doesn't have it (keeps behavior robust)
-            src_cfg_trainer = str(self.settings.get("script_neural_trainer", trainer_name))
-            src_trainer_path = src_main_trainer if os.path.isfile(src_main_trainer) else src_cfg_trainer
+            if not src_trainer_path:
+                return
 
             for coin in coins:
                 if coin == "BTC":
@@ -1848,7 +1863,7 @@ class PowerTraderHub(tk.Tk):
                 # Only copy into folders created at startup (per your request)
                 if created:
                     dst_trainer_path = os.path.join(coin_dir, trainer_name)
-                    if (not os.path.isfile(dst_trainer_path)) and os.path.isfile(src_trainer_path):
+                    if not os.path.isfile(dst_trainer_path):
                         shutil.copy2(src_trainer_path, dst_trainer_path)
         except Exception:
             pass
@@ -3229,27 +3244,31 @@ class PowerTraderHub(tk.Tk):
         #   Alts run from their own coin subfolder
         coin_cwd = self.coin_folders.get(coin, self.project_dir)
 
-        # Use the trainer script that lives INSIDE that coin's folder so outputs land in the right place.
+        # Use the trainer script name from settings
         trainer_name = os.path.basename(str(self.settings.get("script_neural_trainer", "pt_trainer.py")))
 
-        # If an alt coin folder doesn't exist yet, create it and copy the trainer script from the main (BTC) folder.
-        # (Also: overwrite to avoid running stale trainer copies in alt folders.)
+        # 1) Correctly identify the SOURCE trainer script by checking both the BTC folder and the project directory.
+        src_main_folder = self.coin_folders.get("BTC", self.project_dir)
+        src_options = [
+            os.path.join(src_main_folder, trainer_name),
+            os.path.join(self.project_dir, trainer_name)
+        ]
+        src_trainer_path = next((p for p in src_options if os.path.isfile(p)), None)
 
-        if coin != "BTC":
+        # 2) Ensure the target directory exists (especially important for non-BTC coins)
+        try:
+            if not os.path.exists(coin_cwd):
+                os.makedirs(coin_cwd, exist_ok=True)
+        except Exception:
+            pass
+
+        # 3) Copy the trainer script to the target folder if it's missing (works for BTC too if main_dir is separate)
+        trainer_path = os.path.join(coin_cwd, trainer_name)
+        if src_trainer_path and not os.path.isfile(trainer_path):
             try:
-                if not os.path.isdir(coin_cwd):
-                    os.makedirs(coin_cwd, exist_ok=True)
-
-                src_main_folder = self.coin_folders.get("BTC", self.project_dir)
-                src_trainer_path = os.path.join(src_main_folder, trainer_name)
-                dst_trainer_path = os.path.join(coin_cwd, trainer_name)
-
-                if os.path.isfile(src_trainer_path):
-                    shutil.copy2(src_trainer_path, dst_trainer_path)
+                shutil.copy2(src_trainer_path, trainer_path)
             except Exception:
                 pass
-
-        trainer_path = os.path.join(coin_cwd, trainer_name)
 
         if not os.path.isfile(trainer_path):
             messagebox.showerror(
@@ -3424,6 +3443,22 @@ class PowerTraderHub(tk.Tk):
         # --- flow gating: Train -> Start All ---
         status_map = self._training_status_map()
         all_trained = all(v == "TRAINED" for v in status_map.values()) if status_map else False
+
+        # Detect training completion transitions and refresh coin_folders when training finishes
+        # This allows "Start All" to work immediately after training without restart
+        try:
+            # Store previous status map to detect transitions
+            prev_status = getattr(self, "_last_training_status_map", {})
+            if prev_status != status_map:
+                # Check if any coin transitioned from TRAINING to TRAINED
+                for coin, status in status_map.items():
+                    if status == "TRAINED" and prev_status.get(coin) == "TRAINING":
+                        # Training just completed - rebuild coin_folders to pick up new data
+                        self.coin_folders = build_coin_folders(self.settings["main_neural_dir"], self.coins)
+                        break
+            self._last_training_status_map = status_map
+        except Exception:
+            pass
 
         # Disable Start All until training is done (but always allow it if something is already running/pending,
         # so the user can still stop everything).

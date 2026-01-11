@@ -307,12 +307,39 @@ class BybitExchange(Exchange):
             return {"results": []}
 
     def get_orders(self, symbol: str) -> Any:
-        # Bybit: details...
-        # For simplicity, we might just return empty if history is hard to map, 
-        # BUT calculate_cost_basis relies on this.
-        # This is the hardest part.
-        pass # To be implemented fully or standardized.
-        return {"results": []} 
+        # RH: BTC-USD -> Bybit: BTCUSDT
+        sym_bb = symbol.replace("-USD", "USDT")
+        try:
+            # Fetch from Bybit V5 order history (Spot category)
+            resp = self.session.get_order_history(category="spot", symbol=sym_bb, limit=50)
+            if resp.get('retCode') != 0:
+                msg = str(resp.get('retMsg', 'Unknown')).encode('ascii', 'ignore').decode('ascii')
+                print(f"[Bybit] get_order_history failed: {msg}")
+                return {"results": []}
+            
+            results = []
+            orders_list = resp.get('result', {}).get('list', [])
+            for o in orders_list:
+                # Normalize to the structure expected by calculate_cost_basis/initialize_dca_levels
+                # RH expects "state": "filled", "side": "buy"/"sell", "created_at": iso_str, "executions": [...]
+                normalized = {
+                    "id": o.get('orderId'),
+                    "side": o.get('side', '').lower(),
+                    "state": "filled" if o.get('orderStatus') == "Filled" else o.get('orderStatus', '').lower(),
+                    "created_at": o.get('createdTime'), # Milliseconds timestamp as string
+                    "executions": [
+                        {
+                            "quantity": o.get('cumExecQty', '0'),
+                            "effective_price": o.get('avgPrice', '0')
+                        }
+                    ]
+                }
+                results.append(normalized)
+            return {"results": results}
+        except Exception as e:
+            msg = str(e).encode('ascii', 'ignore').decode('ascii')
+            print(f"[Bybit] get_orders failed: {msg}")
+            return {"results": []}
 
     def get_price(self, symbols: list) -> tuple:
         # Bybit Tickers
@@ -410,6 +437,9 @@ class PowerTraderBot:
 
         # Cache last known bid/ask per symbol so transient API misses don't zero out account value
         self._last_good_bid_ask = {}
+
+        # Cache last known position data per symbol to prevent UI flickering on transient API misses
+        self._last_good_positions = {}
 
         # Cache last *complete* account snapshot so transient holdings/price misses can't write a bogus low value
         self._last_good_account_snapshot = {
@@ -896,8 +926,24 @@ class PowerTraderBot:
                 if remaining_quantity <= 0:
                     break
 
+            if total_cost == 0.0 and current_quantities.get(asset_code, 0) > 0:
+                # Fallback: if quantity > 0 but no history found, use current price as basis
+                try:
+                    # Use self.get_price directly which handles exchange triplet
+                    res = self.get_price([f"{asset_code}-USD"])
+                    if res and len(res) >= 1:
+                        buy_px = res[0]
+                        fallback_price = buy_px.get(f"{asset_code}-USD", 0.0)
+                        if fallback_price > 0:
+                             print(f"  [Basis] No history for {asset_code}. Falling back to current price: ${fallback_price:.2f}")
+                             cost_basis[asset_code] = fallback_price
+                except Exception as e:
+                    print(f"  [Basis] Fallback failed for {asset_code}: {e}")
+                    pass
+
             if current_quantities.get(asset_code, 0) > 0:
-                cost_basis[asset_code] = total_cost / current_quantities[asset_code]
+                if asset_code not in cost_basis: # Only if fallback didn't already set it
+                    cost_basis[asset_code] = total_cost / current_quantities[asset_code]
             else:
                 cost_basis[asset_code] = 0.0
 
@@ -1146,7 +1192,13 @@ class PowerTraderBot:
             symbol = holding["asset_code"]
             full_symbol = f"{symbol}-USD"
 
-            if full_symbol not in valid_symbols or symbol == "USDC":
+            if symbol == "USDC":
+                continue
+
+            # If missing price this tick, try to recover from cache
+            if full_symbol not in valid_symbols:
+                if symbol in self._last_good_positions:
+                    positions[symbol] = self._last_good_positions[symbol]
                 continue
 
             quantity = float(holding["total_quantity"])
@@ -1259,9 +1311,11 @@ class PowerTraderBot:
 
                 if trail_line_disp > 0:
                     dist_to_trail_pct = ((current_sell_price - trail_line_disp) / trail_line_disp) * 100.0
-            file = open(symbol+'_current_price.txt', 'w+')
-            file.write(str(current_buy_price))
-            file.close()
+            try:
+                with open(symbol + '_current_price.txt', 'w+') as f:
+                    f.write(str(current_buy_price))
+            except Exception:
+                pass
             positions[symbol] = {
                 "quantity": quantity,
                 "avg_cost_basis": avg_cost_basis,
@@ -1280,6 +1334,8 @@ class PowerTraderBot:
                 "trail_peak": float(trail_peak_disp) if trail_peak_disp else 0.0,
                 "dist_to_trail_pct": float(dist_to_trail_pct) if dist_to_trail_pct else 0.0,
             }
+            # Update cache
+            self._last_good_positions[symbol] = positions[symbol]
 
 
             print(
