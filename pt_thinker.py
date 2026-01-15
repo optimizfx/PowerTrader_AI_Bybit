@@ -456,11 +456,6 @@ def step_coin(sym: str):
 	coin = sym + '-USDT'
 	st = states[sym]
 
-	# DEBUG: check folder
-	if getattr(st, '_debug_logged_folder', False) is False:
-		print(f"[DEBUG] {sym} using folder: {folder}")
-		st['_debug_logged_folder'] = True
-
 	# --- training freshness gate ---
 	# If GUI would show NOT TRAINED (missing / stale trainer_last_training_time.txt),
 	# skip this coin so no new trades can start until it is trained again.
@@ -719,14 +714,15 @@ def step_coin(sym: str):
 		tf_update = ['no'] * len(tf_choices)
 
 		# get current price ONCE per coin — use Bybit's current ASK
-		rh_symbol = f"{sym}-USD"
+		bybit_symbol = f"{sym}-USD"
 		while True:
 			try:
-				current = get_current_ask(rh_symbol)
+				current = get_current_ask(bybit_symbol)
 				break
 			except Exception as e:
-				print(f"Error fetching {rh_symbol}, retrying... {e}")
-				time.sleep(1)
+				print(f"Error fetching {bybit_symbol}, retrying... {e}")
+			except Exception as e:
+				print(e)
 				continue
 
 		# IMPORTANT: messages printed below use the bounds currently in state.

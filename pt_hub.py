@@ -114,7 +114,7 @@ class WrapFrame(ttk.Frame):
 
 class NeuralSignalTile(ttk.Frame):
 
-    def __init__(self, parent: tk.Widget, coin: str, bar_height: int = 52, levels: int = 8):
+    def __init__(self, parent: tk.Widget, coin: str, bar_height: int = 52, levels: int = 8, trade_start_level: int = 3):
         super().__init__(parent)
         self.coin = coin
 
@@ -186,10 +186,13 @@ class NeuralSignalTile(ttk.Frame):
                 )
             )
 
-        # Marker line after the 2nd block (between 2 and 3) -- LONG side only.
-        # With display_levels=7, "after 2nd block" means boundary after seg index 1.
-        trade_y = int(round(yb - (2 * self._bar_h / self._display_levels)))
-        self.canvas.create_line(x0, trade_y, x1, trade_y, fill=DARK_FG, width=2)
+        # Trade-start marker line (boundary before the trade-start level).
+        # Example: trade_start_level=3 => line after 2nd block (between 2 and 3).
+        self._trade_line_geom = (x0, x1, x2, x3, yb)
+        self._trade_line_long = self.canvas.create_line(x0, yb, x1, yb, fill=DARK_FG, width=2)
+        self._trade_line_short = self.canvas.create_line(x2, yb, x3, yb, fill=DARK_FG, width=2)
+        self._trade_start_level = 3
+        self.set_trade_start_level(trade_start_level)
 
         self.value_lbl = ttk.Label(self, text="L:0 S:0")
         self.value_lbl.pack(anchor="center", pady=(1, 0))
@@ -222,6 +225,33 @@ class NeuralSignalTile(ttk.Frame):
         except Exception:
             pass
 
+    def set_trade_start_level(self, level: Any) -> None:
+        """Move the marker line to the boundary before the chosen start level."""
+        self._trade_start_level = self._clamp_trade_start_level(level)
+        self._update_trade_lines()
+
+    def _clamp_trade_start_level(self, value: Any) -> int:
+        try:
+            v = int(float(value))
+        except Exception:
+            v = 3
+        # Trade starts at levels 1..display_levels (usually 1..7)
+        return max(1, min(v, self._display_levels))
+
+    def _update_trade_lines(self) -> None:
+        try:
+            x0, x1, x2, x3, yb = self._trade_line_geom
+        except Exception:
+            return
+
+        k = max(0, min(int(self._trade_start_level) - 1, self._display_levels))
+        y = int(round(yb - (k * self._bar_h / self._display_levels)))
+
+        try:
+            self.canvas.coords(self._trade_line_long, x0, y, x1, y)
+            self.canvas.coords(self._trade_line_short, x2, y, x3, y)
+        except Exception:
+            pass        
 
     def _clamp_level(self, value: Any) -> int:
         try:
@@ -274,6 +304,16 @@ DEFAULT_SETTINGS = {
     "coins": ["BTC", "ETH", "XRP", "BNB", "DOGE"],
     "exchange": "BYBIT",
     "bybit_demo": False,
+    "trade_start_level": 3,  # trade starts when long signal >= this level (1..7)
+    "start_allocation_pct": 0.005,  # % of total account value for initial entry (min $0.50 per coin)
+    "dca_multiplier": 2.0,  # DCA buy size = current value * this (2.0 => total scales ~3x per DCA)
+    "dca_levels": [-2.5, -5.0, -10.0, -20.0, -30.0, -40.0, -50.0],  # Hard DCA triggers (percent PnL)
+    "max_dca_buys_per_24h": 2,  # max DCA buys per coin in rolling 24h window (0 disables DCA buys)
+
+    # --- Trailing Profit Margin settings (used by pt_trader.py; shown in GUI settings) ---
+    "pm_start_pct_no_dca": 5.0,
+    "pm_start_pct_with_dca": 2.5,
+    "trailing_gap_pct": 0.5,
     "default_timeframe": "1hour",
     "timeframes": [
         "1min", "5min", "15min", "30min",
@@ -290,9 +330,6 @@ DEFAULT_SETTINGS = {
     "auto_start_scripts": False,
     "use_gpu": False,
 }
-
-
-
 
 SETTINGS_FILE = "gui_settings.json"
 
@@ -773,8 +810,8 @@ class CandleChart(ttk.Frame):
         current_sell_price: Optional[float] = None,
         trail_line: Optional[float] = None,
         dca_line_price: Optional[float] = None,
+        avg_cost_basis: Optional[float] = None,
     ) -> None:
-
 
         cfg = self.settings_getter()
 
@@ -908,6 +945,13 @@ class CandleChart(ttk.Frame):
         except Exception:
             pass
 
+        # Overlay avg cost basis (yellow)
+        try:
+            if avg_cost_basis is not None and float(avg_cost_basis) > 0:
+                self.ax.axhline(y=float(avg_cost_basis), linewidth=1.5, color="yellow", alpha=0.95)
+        except Exception:
+            pass
+
         # Overlay current ask/bid prices
         try:
             if current_buy_price is not None and float(current_buy_price) > 0:
@@ -921,7 +965,7 @@ class CandleChart(ttk.Frame):
         except Exception:
             pass
 
-        # Right-side price labels (so you can read Bid/Ask/DCA/Sell at a glance)
+        # Right-side price labels (so you can read Bid/Ask/DCA/AVG/Sell at a glance)
         try:
             trans = blended_transform_factory(self.ax.transAxes, self.ax.transData)
             used_y: List[float] = []
@@ -968,6 +1012,7 @@ class CandleChart(ttk.Frame):
             # Map to your terminology: Ask=buy line, Bid=sell line
             _label_right(current_buy_price, "ASK", "purple")
             _label_right(current_sell_price, "BID", "teal")
+            _label_right(avg_cost_basis, "AVG", "yellow")
             _label_right(dca_line_price, "DCA", "red")
             _label_right(trail_line, "SELL", "green")
         except Exception:
@@ -1269,36 +1314,46 @@ class AccountValueChart(ttk.Frame):
 
 
         # Downsample to <= 250 points by AVERAGING buckets instead of skipping points.
-        # This keeps the chart visually stable when new nearby values arrive.
+        # IMPORTANT: never average the VERY FIRST or VERY LAST point.
+        # - First point should remain the true first historical value.
+        # - Last point should remain the true current/final account value (so the title and chart end match account info).
         max_keep = min(max(2, int(self.max_points or 250)), 250)
         n = len(points)
 
         if n > max_keep:
-            bucket_size = n / float(max_keep)
-            new_points: List[Tuple[float, float]] = []
+            first_pt = points[0]
+            last_pt = points[-1]
 
-            for i in range(max_keep):
-                start = int(i * bucket_size)
-                end = int((i + 1) * bucket_size)
-                if end <= start:
-                    end = start + 1
-                if start >= n:
-                    break
-                if end > n:
-                    end = n
+            mid_points = points[1:-1]
+            mid_n = len(mid_points)
+            keep_mid = max_keep - 2
 
-                bucket = points[start:end]
-                if not bucket:
-                    continue
+            if keep_mid <= 0 or mid_n <= 0:
+                points = [first_pt, last_pt]
+            elif mid_n <= keep_mid:
+                points = [first_pt] + mid_points + [last_pt]
+            else:
+                bucket_size = mid_n / float(keep_mid)
+                new_mid: List[Tuple[float, float]] = []
+                for i in range(keep_mid):
+                    start = int(i * bucket_size)
+                    end = int((i + 1) * bucket_size)
+                    if end <= start:
+                        end = start + 1
+                    if start >= mid_n:
+                        break
+                    if end > mid_n:
+                        end = mid_n
+                    bucket = mid_points[start:end]
+                    if not bucket:
+                        continue
 
-                # Average timestamp and account value within the bucket
-                avg_ts = sum(p[0] for p in bucket) / len(bucket)
-                avg_val = sum(p[1] for p in bucket) / len(bucket)
+                    # Average timestamp and account value within the bucket (MID ONLY)
+                    avg_ts = sum(p[0] for p in bucket) / len(bucket)
+                    avg_val = sum(p[1] for p in bucket) / len(bucket)
+                    new_mid.append((avg_ts, avg_val))
 
-                new_points.append((avg_ts, avg_val))
-
-            points = new_points
-
+                points = [first_pt] + new_mid + [last_pt]
 
         # clear artists (fast) / fallback to cla()
         try:
@@ -1800,10 +1855,10 @@ class PowerTraderHub(tk.Tk):
     # ---- settings ----
 
     def _load_settings(self) -> dict:
-        data = _safe_read_json(SETTINGS_FILE)
+        settings_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), SETTINGS_FILE)
+        data = _safe_read_json(settings_path)
         if not isinstance(data, dict):
             data = {}
-
         merged = dict(DEFAULT_SETTINGS)
         merged.update(data)
         # normalize
@@ -1811,7 +1866,8 @@ class PowerTraderHub(tk.Tk):
         return merged
 
     def _save_settings(self) -> None:
-        _safe_write_json(SETTINGS_FILE, self.settings)
+        settings_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), SETTINGS_FILE)
+        _safe_write_json(settings_path, self.settings)
 
     def _settings_getter(self) -> dict:
         return self.settings
@@ -2594,7 +2650,9 @@ class PowerTraderHub(tk.Tk):
                                     current_sell_price=sell_px,
                                     trail_line=trail_line,
                                     dca_line_price=dca_line_price,
+                                    avg_cost_basis=avg_cost_basis,
                                 )
+
                             except Exception:
                                 pass
 
@@ -3417,6 +3475,7 @@ class PowerTraderHub(tk.Tk):
             sell_px = pos.get("current_sell_price", None)
             trail_line = pos.get("trail_line", None)
             dca_line_price = pos.get("dca_line_price", None)
+            avg_cost_basis = pos.get("avg_cost_basis", None)
 
             chart.refresh(
                 self.coin_folders,
@@ -3424,12 +3483,14 @@ class PowerTraderHub(tk.Tk):
                 current_sell_price=sell_px,
                 trail_line=trail_line,
                 dca_line_price=dca_line_price,
+                avg_cost_basis=avg_cost_basis,
             )
 
             # Keep the periodic refresh behavior consistent (prevents an immediate full refresh right after this).
             self._last_chart_refresh = time.time()
         except Exception:
             pass
+
 
     # ---- refresh loop ----
     def _drain_queue_to_text(self, q: "queue.Queue[str]", txt: tk.Text, max_lines: int = 2500) -> None:
@@ -3597,6 +3658,7 @@ class PowerTraderHub(tk.Tk):
                     sell_px = pos.get("current_sell_price", None)
                     trail_line = pos.get("trail_line", None)
                     dca_line_price = pos.get("dca_line_price", None)
+                    avg_cost_basis = pos.get("avg_cost_basis", None)
                     try:
                         chart.refresh(
                             self.coin_folders,
@@ -3604,6 +3666,7 @@ class PowerTraderHub(tk.Tk):
                             current_sell_price=sell_px,
                             trail_line=trail_line,
                             dca_line_price=dca_line_price,
+                            avg_cost_basis=avg_cost_basis,
                         )
                     except Exception:
                         pass
@@ -3681,6 +3744,8 @@ class PowerTraderHub(tk.Tk):
         try:
             total_val = float(acct.get("total_account_value", 0.0) or 0.0)
 
+            self._last_total_account_value = total_val
+
             self.lbl_acct_total_value.config(
                 text=f"Total Account Value: {_fmt_money(acct.get('total_account_value', None))}"
             )
@@ -3700,34 +3765,45 @@ class PowerTraderHub(tk.Tk):
 
             # -------------------------
             # DCA affordability
-            # - Entry allocation mirrors pt_trader.py: total_val * (0.00005 / N) with min $0.50
-            # - Each DCA buy mirrors pt_trader.py: dca_amount = value * 2  (=> total scales ~3x per DCA)
+            # - Entry allocation mirrors pt_trader.py:
+            #     total_val * ((start_allocation_pct/100) / N) with min $0.50
+            # - Each DCA buy mirrors pt_trader.py: dca_amount = value * dca multiplier  (=> total scales ~(1+multiplier)x per DCA)
             # -------------------------
             coins = getattr(self, "coins", None) or []
-            n = len(coins) if len(coins) > 0 else 1
+            n = len(coins)
 
             spread_levels = 0
             single_levels = 0
 
             if total_val > 0.0:
+                alloc_pct = float(self.settings.get("start_allocation_pct", 0.005) or 0.005)
+                if alloc_pct < 0.0:
+                    alloc_pct = 0.0
+                alloc_frac = alloc_pct / 100.0
+
+                dca_mult = float(self.settings.get("dca_multiplier", 2.0) or 2.0)
+                if dca_mult < 0.0:
+                    dca_mult = 0.0
+                dca_factor = 1.0 + dca_mult
+
                 # Spread across all coins
-                alloc_spread = total_val * (0.00005 / n)
+                alloc_spread = total_val * alloc_frac
                 if alloc_spread < 0.5:
                     alloc_spread = 0.5
 
                 required = alloc_spread * n  # initial buys for all coins
-                while required > 0.0 and (required * 3.0) <= (total_val + 1e-9):
-                    required *= 3.0
+                while required > 0.0 and (required * dca_factor) <= (total_val + 1e-9):
+                    required *= dca_factor
                     spread_levels += 1
 
                 # All DCA into a single coin
-                alloc_single = total_val * 0.00005
+                alloc_single = total_val * alloc_frac
                 if alloc_single < 0.5:
                     alloc_single = 0.5
 
                 required = alloc_single  # initial buy for one coin
-                while required > 0.0 and (required * 3.0) <= (total_val + 1e-9):
-                    required *= 3.0
+                while required > 0.0 and (required * dca_factor) <= (total_val + 1e-9):
+                    required *= dca_factor
                     single_levels += 1
 
             # Show labels + number (one line each)
@@ -3821,6 +3897,33 @@ class PowerTraderHub(tk.Tk):
 
             dca_stages = pos.get("dca_triggered_stages", 0)
             dca_24h = int(dca_24h_by_coin.get(str(coin).upper().strip(), 0))
+
+
+            # Display + heading reflect the current max DCA setting (hot-reload friendly)
+            try:
+                max_dca_24h = int(float(self.settings.get("max_dca_buys_per_24h", DEFAULT_SETTINGS.get("max_dca_buys_per_24h", 2)) or 2))
+
+            except Exception:
+                max_dca_24h = int(DEFAULT_SETTINGS.get("max_dca_buys_per_24h", 2) or 2)
+            if max_dca_24h < 0:
+                max_dca_24h = 0
+            try:
+                self.trades_tree.heading("dca_24h", text=f"DCA 24h (max {max_dca_24h})")
+            except Exception:
+                pass
+            dca_24h_display = f"{dca_24h}/{max_dca_24h}"
+
+
+            # Display + heading reflect trailing PM settings (hot-reload friendly)
+            try:
+                pm0 = float(self.settings.get("pm_start_pct_no_dca", DEFAULT_SETTINGS.get("pm_start_pct_no_dca", 5.0)) or 5.0)
+                pm1 = float(self.settings.get("pm_start_pct_with_dca", DEFAULT_SETTINGS.get("pm_start_pct_with_dca", 2.5)) or 2.5)
+                tg = float(self.settings.get("trailing_gap_pct", DEFAULT_SETTINGS.get("trailing_gap_pct", 0.5)) or 0.5)
+                self.trades_tree.heading("trail_line", text=f"Trail Line (start {pm0:g}/{pm1:g}%, gap {tg:g}%)")
+
+            except Exception:
+                pass
+
             next_dca = pos.get("next_dca_display", "")
 
             trail_line = pos.get("trail_line", 0.0)
@@ -3838,17 +3941,11 @@ class PowerTraderHub(tk.Tk):
                     _fmt_price(sell_price),
                     _fmt_pct(sell_pnl),
                     dca_stages,
-                    dca_24h,
+                    dca_24h_display,
                     next_dca,
                     _fmt_price(trail_line),  # trail line is a price level
                 ),
             )
-
-
-
-
-
-
 
 
     def _refresh_pnl(self) -> None:
@@ -4022,7 +4119,7 @@ class PowerTraderHub(tk.Tk):
         self.neural_tiles = {}
 
         for coin in (self.coins or []):
-            tile = NeuralSignalTile(self.neural_wrap, coin)
+            tile = NeuralSignalTile(self.neural_wrap, coin, trade_start_level=int(self.settings.get("trade_start_level", 3) or 3))
 
             # --- Hover highlighting (real, visible) ---
             def _on_enter(_e=None, t=tile):
@@ -4501,6 +4598,20 @@ class PowerTraderHub(tk.Tk):
 
 
         coins_var = tk.StringVar(value=",".join(self.settings["coins"]))
+        trade_start_level_var = tk.StringVar(value=str(self.settings.get("trade_start_level", 3)))
+        start_alloc_pct_var = tk.StringVar(value=str(self.settings.get("start_allocation_pct", 0.005)))
+        dca_mult_var = tk.StringVar(value=str(self.settings.get("dca_multiplier", 2.0)))
+        _dca_levels = self.settings.get("dca_levels", DEFAULT_SETTINGS.get("dca_levels", []))
+        if not isinstance(_dca_levels, list):
+            _dca_levels = DEFAULT_SETTINGS.get("dca_levels", [])
+        dca_levels_var = tk.StringVar(value=",".join(str(x) for x in _dca_levels))
+        max_dca_var = tk.StringVar(value=str(self.settings.get("max_dca_buys_per_24h", DEFAULT_SETTINGS.get("max_dca_buys_per_24h", 2))))
+
+        # --- Trailing PM settings (editable; hot-reload friendly) ---
+        pm_no_dca_var = tk.StringVar(value=str(self.settings.get("pm_start_pct_no_dca", DEFAULT_SETTINGS.get("pm_start_pct_no_dca", 5.0))))
+        pm_with_dca_var = tk.StringVar(value=str(self.settings.get("pm_start_pct_with_dca", DEFAULT_SETTINGS.get("pm_start_pct_with_dca", 2.5))))
+        trailing_gap_var = tk.StringVar(value=str(self.settings.get("trailing_gap_pct", DEFAULT_SETTINGS.get("trailing_gap_pct", 0.5))))
+
         exchange_var = tk.StringVar(value=self.settings.get("exchange", "BYBIT"))
         r = 0
         hub_dir_var = tk.StringVar(value=self.settings.get("hub_data_dir", ""))
@@ -4515,6 +4626,58 @@ class PowerTraderHub(tk.Tk):
         auto_start_var = tk.BooleanVar(value=bool(self.settings.get("auto_start_scripts", False)))
 
         add_row(r, "Choose which coins to trade:", coins_var); r += 1
+        add_row(r, "Trade start level (1-7):", trade_start_level_var); r += 1
+
+        # Start allocation % (shows approx $/coin using the last known account value; always displays the $0.50 minimum)
+        ttk.Label(frm, text="Start allocation %:").grid(row=r, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Entry(frm, textvariable=start_alloc_pct_var).grid(row=r, column=1, sticky="ew", pady=6)
+
+        start_alloc_hint_var = tk.StringVar(value="")
+        ttk.Label(frm, textvariable=start_alloc_hint_var).grid(row=r, column=2, sticky="w", padx=(10, 0), pady=6)
+
+        def _update_start_alloc_hint(*_):
+            # Parse % (allow "0.01" or "0.01%")
+            try:
+                pct_txt = (start_alloc_pct_var.get() or "").strip().replace("%", "")
+                pct = float(pct_txt) if pct_txt else 0.0
+            except Exception:
+                pct = float(self.settings.get("start_allocation_pct", 0.005) or 0.005)
+
+            if pct < 0.0:
+                pct = 0.0
+
+            # Use the last account value we saw in trader_status.json (no extra API calls).
+            try:
+                total_val = float(getattr(self, "_last_total_account_value", 0.0) or 0.0)
+            except Exception:
+                total_val = 0.0
+
+            coins_list = [c.strip().upper() for c in (coins_var.get() or "").split(",") if c.strip()]
+            n_coins = len(coins_list) if coins_list else 1
+
+            per_coin = 0.0
+            if total_val > 0.0:
+                per_coin = total_val * (pct / 100.0)
+            if per_coin < 0.5:
+                per_coin = 0.5
+
+            if total_val > 0.0:
+                start_alloc_hint_var.set(f"≈ {_fmt_money(per_coin)} per coin (min $0.50)")
+            else:
+                start_alloc_hint_var.set("≈ $0.50 min per coin (needs account value)")
+
+        _update_start_alloc_hint()
+        start_alloc_pct_var.trace_add("write", _update_start_alloc_hint)
+        coins_var.trace_add("write", _update_start_alloc_hint)
+
+        r += 1
+
+        add_row(r, "DCA levels (% list):", dca_levels_var); r += 1
+        add_row(r, "DCA multiplier:", dca_mult_var); r += 1
+        add_row(r, "Max DCA buys / coin (rolling 24h):", max_dca_var); r += 1
+        add_row(r, "Trailing PM start % (no DCA):", pm_no_dca_var); r += 1
+        add_row(r, "Trailing PM start % (with DCA):", pm_with_dca_var); r += 1
+        add_row(r, "Trailing gap % (behind peak):", trailing_gap_var); r += 1
 
         ttk.Label(frm, text="Exchange:").grid(row=r, column=0, sticky="w", padx=(0, 10), pady=6)
         exc_cb = ttk.Combobox(frm, textvariable=exchange_var, values=["BYBIT"], state="readonly")
@@ -4569,6 +4732,65 @@ class PowerTraderHub(tk.Tk):
                 prev_coins = set([str(c).strip().upper() for c in (self.settings.get("coins") or []) if str(c).strip()])
 
                 self.settings["coins"] = [c.strip().upper() for c in coins_var.get().split(",") if c.strip()]
+                self.settings["trade_start_level"] = max(1, min(int(float(trade_start_level_var.get().strip())), 7))
+                sap = (start_alloc_pct_var.get() or "").strip().replace("%", "")
+
+                self.settings["start_allocation_pct"] = max(0.0, float(sap or 0.0))
+
+                dm = (dca_mult_var.get() or "").strip()
+                try:
+                    dm_f = float(dm)
+                except Exception:
+                    dm_f = float(self.settings.get("dca_multiplier", DEFAULT_SETTINGS.get("dca_multiplier", 2.0)) or 2.0)
+                if dm_f < 0.0:
+                    dm_f = 0.0
+                self.settings["dca_multiplier"] = dm_f
+
+                raw_dca = (dca_levels_var.get() or "").replace(",", " ").split()
+                dca_levels = []
+                for tok in raw_dca:
+                    try:
+                        dca_levels.append(float(tok))
+                    except Exception:
+                        pass
+                if not dca_levels:
+                    dca_levels = list(DEFAULT_SETTINGS.get("dca_levels", []))
+                self.settings["dca_levels"] = dca_levels
+
+                md = (max_dca_var.get() or "").strip()
+                try:
+                    md_i = int(float(md))
+                except Exception:
+                    md_i = int(self.settings.get("max_dca_buys_per_24h", DEFAULT_SETTINGS.get("max_dca_buys_per_24h", 2)) or 2)
+                if md_i < 0:
+                    md_i = 0
+                self.settings["max_dca_buys_per_24h"] = md_i
+
+                # --- Trailing PM settings ---
+                try:
+                    pm0 = float((pm_no_dca_var.get() or "").strip().replace("%", "") or 0.0)
+                except Exception:
+                    pm0 = float(self.settings.get("pm_start_pct_no_dca", DEFAULT_SETTINGS.get("pm_start_pct_no_dca", 5.0)) or 5.0)
+                if pm0 < 0.0:
+                    pm0 = 0.0
+                self.settings["pm_start_pct_no_dca"] = pm0
+
+                try:
+                    pm1 = float((pm_with_dca_var.get() or "").strip().replace("%", "") or 0.0)
+                except Exception:
+                    pm1 = float(self.settings.get("pm_start_pct_with_dca", DEFAULT_SETTINGS.get("pm_start_pct_with_dca", 2.5)) or 2.5)
+                if pm1 < 0.0:
+                    pm1 = 0.0
+                self.settings["pm_start_pct_with_dca"] = pm1
+
+                try:
+                    tg = float((trailing_gap_var.get() or "").strip().replace("%", "") or 0.0)
+                except Exception:
+                    tg = float(self.settings.get("trailing_gap_pct", DEFAULT_SETTINGS.get("trailing_gap_pct", 0.5)) or 0.5)
+                if tg < 0.0:
+                    tg = 0.0
+
+                self.settings["trailing_gap_pct"] = tg
                 self.settings["hub_data_dir"] = hub_dir_var.get().strip()
                 self.settings["script_neural_runner2"] = neural_script_var.get().strip()
                 self.settings["script_neural_trainer"] = trainer_script_var.get().strip()
@@ -4641,4 +4863,3 @@ class PowerTraderHub(tk.Tk):
 if __name__ == "__main__":
     app = PowerTraderHub()
     app.mainloop()
-

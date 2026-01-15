@@ -235,12 +235,20 @@ def should_stop_training(loop_i, every=50):
 
 def PrintException():
 	exc_type, exc_obj, tb = sys.exc_info()
+	# IMPORTANT: don't swallow clean exits (sys.exit()) or Ctrl+C
+	if isinstance(exc_obj, (SystemExit, KeyboardInterrupt)):
+		raise
+
+	# Safety: sometimes tb can be None
+	if tb is None:
+		print(f"EXCEPTION: {exc_obj}")
+		return
 	f = tb.tb_frame
 	lineno = tb.tb_lineno
 	filename = f.f_code.co_filename
 	linecache.checkcache(filename)
 	line = linecache.getline(filename, lineno, f.f_globals)
-	print ('EXCEPTION IN (LINE {} "{}"): {}'.format(lineno, line.strip(), exc_obj))
+	print('EXCEPTION IN (LINE {} "{}"): {}'.format(lineno, line.strip(), exc_obj))
 how_far_to_look_back = 100000
 number_of_candles = [2]
 number_of_candles_index = 0
@@ -691,7 +699,7 @@ while True:
 				flush_memory(tf_choice, force=True)
 
 				while True:
-					continue
+					sys.exit(0)
 				the_big_index += 1
 				restarted_yet = 0
 				avg50 = []
@@ -790,14 +798,6 @@ while True:
 				upordown5 = []
 				import json
 				import uuid
-				def PrintException():
-					exc_type, exc_obj, tb = sys.exc_info()
-					f = tb.tb_frame
-					lineno = tb.tb_lineno
-					filename = f.f_code.co_filename
-					linecache.checkcache(filename)
-					line = linecache.getline(filename, lineno, f.f_globals)
-					print ('EXCEPTION IN (LINE {} "{}"): {}'.format(lineno, line.strip(), exc_obj))
 				how_far_to_look_back = 100000
 				list_len = 0
 				if the_big_index >= len(tf_choices):
@@ -1729,22 +1729,31 @@ while True:
 													break
 												else:
 													continue
-										except:
+										except SystemExit:
+											raise
+										except KeyboardInterrupt:
+											raise
+
 											PrintException()
-											while True:
-												continue
+											break
 									if which_candle_of_the_prediction_index >= candles_to_predict:
 										break
 									else:
 										continue
-								except:
+								except SystemExit:
+									raise
+								except KeyboardInterrupt:
+									raise
+								except Exception:
 									PrintException()
-									while True:
-										continue
-							except:
+									break
+							except SystemExit:
+								raise
+							except KeyboardInterrupt:
+								raise
+							except Exception:
 								PrintException()
-								while True:
-									continue
+								break
 					else:
 						pass
 					coin_choice_index += 1
