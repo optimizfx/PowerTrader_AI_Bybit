@@ -908,6 +908,12 @@ while True:
 							file = open('memory_weights_low_'+tf_choice+'.txt','r')
 							low_weight_list = file.read().replace("'","").replace(',','').replace('"','').replace(']','').replace('[','').split(' ')
 							file.close()
+						except (FileNotFoundError, OSError):
+							# New coin or missing training data: start fresh
+							memory_list = []
+							weight_list = []
+							high_weight_list = []
+							low_weight_list = []
 							mem_ind = 0
 							diffs_list = []
 							any_perfect = 'no'

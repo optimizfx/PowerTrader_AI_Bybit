@@ -1382,8 +1382,9 @@ class PowerTraderBot:
 
                     return response  # Successfully placed (and fully filled) order
 
-            except Exception:
-                pass  #print(traceback.format_exc())
+            except Exception as e:
+                print(f"  [ERROR] place_buy_order exception: {e}")
+                print(traceback.format_exc())
                 
             # Check for precision errors (RH specific mostly)
             if response and "errors" in response:
@@ -2127,6 +2128,7 @@ class PowerTraderBot:
 
             # Default behavior: long must be >= start_level and short must be 0
             if not (buy_count >= start_level and sell_count == 0):
+                print(f"  [SKIP] {base_symbol}: Neural signals not met (long={buy_count} need>={start_level}, short={sell_count} need=0)")
                 start_index += 1
                 continue
 

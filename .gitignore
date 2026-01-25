@@ -1,7 +1,8 @@
 
 /__pycache__
-/hub_data
-/venv
+/hub_data/
+/training_data/
+/venv/
 
 # API KEYS
 b_key.txt

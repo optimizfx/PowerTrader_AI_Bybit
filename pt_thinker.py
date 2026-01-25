@@ -561,11 +561,14 @@ def step_coin(sym: str):
 		if getattr(st, f'_debug_logged_missing_{tf_choices[tf_choice_index]}', False) is False:
 			print(f"[DEBUG] {sym} {tf_choices[tf_choice_index]} MISSING training file: {thresh_path}")
 			st[f'_debug_logged_missing_{tf_choices[tf_choice_index]}'] = True
-		# ... continue with inactive logic as original code would fail on open() ...
-	
-	file = open(thresh_path, 'r')
-	perfect_threshold = float(file.read())
-	file.close()
+		perfect_threshold = 1.0
+	else:
+		try:
+			file = open(thresh_path, 'r')
+			perfect_threshold = float(file.read())
+			file.close()
+		except Exception:
+			perfect_threshold = 1.0
 
 	try:
 		# If we can read/parse training files, this timeframe is NOT a training-file issue.
